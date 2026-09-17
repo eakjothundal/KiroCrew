@@ -1367,14 +1367,18 @@ class TestSelfArmTrustRecord:
         monkeypatch.setattr(autonudge_selfarm, "data_home", lambda: tmp_path)
         return tmp_path
 
-    def test_record_lives_under_trust_and_round_trips(self, tmp_path: Path) -> None:
+    def test_record_lives_in_its_own_leaf_and_round_trips(self, tmp_path: Path) -> None:
         from kiro_crew import autonudge_selfarm as sa
 
         sa.record_self_arm("abc12345", "member-conductor")
-        assert sa.self_arm_record_path() == tmp_path / "trust" / sa.SELF_ARM_RECORD_NAME
+        assert (
+            sa.self_arm_record_path() == tmp_path / sa.ARM_RECORD_DIRNAME / sa.SELF_ARM_RECORD_NAME
+        )
         assert sa.self_arm_record_path().exists()
+        # Not under ``trust/``, which the sandbox keeps read-write for the SEL appends.
+        assert not (tmp_path / "trust" / sa.SELF_ARM_RECORD_NAME).exists()
         # The read-modify-write transaction is serialised through a sibling lock.
-        assert (tmp_path / "trust" / sa._LOCK_NAME).exists()
+        assert (tmp_path / sa.ARM_RECORD_DIRNAME / sa._LOCK_NAME).exists()
         assert sa.is_recorded_self_arm("abc12345", "member-conductor") is True
         # Same id on another slot does not inherit the authorization.
         assert sa.is_recorded_self_arm("abc12345", "chat-1-1") is False

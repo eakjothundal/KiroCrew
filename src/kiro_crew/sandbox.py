@@ -494,6 +494,17 @@ _CREW_HIDDEN_LEAVES: tuple[str, ...] = (
     # hooks) and ``kirocrew agent create`` / ``delete`` from the operator's shell. Whole
     # directory: ``atomic_write`` publishes through a sibling temp.
     "crew-teams",
+    # The auto-nudge ARM record (``autonudge_selfarm.py``): which loops a
+    # crew/member session armed itself, and which the owner's Perpetual mode
+    # switch armed. Same model as ``crew-panels``, and named here rather than
+    # under ``trust/`` for the same reason: ``trust`` stays sandbox read-write
+    # for the SEL appends, so a record there was writable by a sandboxed command
+    # that built the path at runtime -- and an entry in this record is the whole
+    # of an owner arm's fire-time admission (the loop store beside it is
+    # agent-writable by design). Written and read only by the GATEWAY (the
+    # authorizer, the fire-time guard, the member route, the store's remove); no
+    # in-sandbox code opens it. Pre-created too, for the fresh-install skip.
+    "autonudge-trust",
     # Auth stores and signing keys owned by the gateway web server alone.
     "token_signing.key",
     "refresh_chains.json",
@@ -1582,6 +1593,12 @@ _CREW_PRECREATE_HIDDEN_DIR_LEAVES: tuple[str, ...] = (
     # gateway later reads back as authoritative. Same failure the
     # ``panel-templates`` ceiling has, one list over.
     "crew-panels",
+    # The auto-nudge arm record's directory, by the ``crew-panels`` rule: the
+    # gateway creates it on its first arm, so a sandbox spawned on a fresh
+    # install before that finds the name absent and the mask vacuous -- and an
+    # agent that then created the directory itself could write an entry the
+    # fire-time guard reads as the owner's authorization.
+    "autonudge-trust",
     # Append-only per-unit crew logs, and the hazard is the sharpest here: the
     # record is the AUTHORITY a reader trusts instead of re-deriving, and the
     # store creates this root on its first write. A sandbox spawned before that
@@ -1806,9 +1823,16 @@ def _warn_unsealed_ceiling(target: str, exc: "OSError | None") -> None:
 #:   crew-published DATA is the whole containment story. Replacing that directory is
 #:   authoring markup that renders in the panel, not changing a setting.
 #:
+#: * ``autonudge-trust`` -- the auto-nudge arm record, created on demand by the
+#:   GATEWAY and read by nothing else. Same shape as ``crew-panels``: bind-MASKED,
+#:   so a link at the name leaves the name writable in the data home and a forged
+#:   entry there is an authorization the fire-time guard would honour.
+#:
 #: So for these, a link is refused: the disposition must attach to the same name the
 #: reader uses, and following a link is exactly the gap that voids it.
-_CREW_NO_ALIAS_LEAVES: frozenset[str] = frozenset({"crew-panels", "panel-templates"})
+_CREW_NO_ALIAS_LEAVES: frozenset[str] = frozenset(
+    {"crew-panels", "panel-templates", "autonudge-trust"}
+)
 
 #: Masked leaves where a SYMLINK is tolerated, and why. Every other entry in
 #: :data:`_CREW_HIDDEN_LEAVES` refuses one through :func:`_refuse_aliased_masked_leaves`,

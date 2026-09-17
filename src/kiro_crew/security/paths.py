@@ -806,6 +806,15 @@ _CREW_SECRET_LEAVES: list[str] = [
     # same leaf (sandbox._CREW_HIDDEN_LEAVES) so a runtime-constructed path inside
     # a sandboxed command cannot reach around this gate either.
     "crew-panels",
+    # The auto-nudge ARM record (autonudge_selfarm.py): the entry that lets a
+    # crew/member session's loop fire, and the whole of the owner's Perpetual
+    # mode authorization for a member loop. Fenced because the loop store it
+    # agrees with is agent-writable by design, so this file is the one factor a
+    # forged loop cannot supply. The sandbox masks the same leaf
+    # (sandbox._CREW_HIDDEN_LEAVES) so a runtime-constructed path inside a
+    # sandboxed command cannot reach around this gate either; every legitimate
+    # reader and writer is gateway code opening the path directly.
+    "autonudge-trust",
     # Managed memory uses bound tools. This directory guard keeps ordinary raw
     # file operations away from DB/WAL/SHM and manual context publication files;
     # glob-based project guidance skips it. It is a best-effort path guard, not

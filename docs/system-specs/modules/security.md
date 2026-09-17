@@ -57,6 +57,26 @@ the redactors; and replacing `panel-templates/` is authoring markup that renders
 in the panel rather than changing a setting. A warning was what made this silent —
 the log said the path was sealed while the writes went elsewhere.
 
+`autonudge-trust/` takes the `crew-panels/` disposition whole — HIDDEN, precreated,
+and in `_CREW_NO_ALIAS_LEAVES` — because it holds the auto-nudge ARM record
+(`autonudge_selfarm.py`): the entry that lets a crew/member session's own loop fire
+and the whole of the owner's Perpetual mode authorization for a member loop. It is
+NOT under `trust/`, which is a declared sandbox read-write exception (the in-sandbox
+MCP servers append to the audit log there and `verify_session_pid` reads the SEL
+key), so a record placed there stayed writable by a same-UID sandboxed command that
+built the path at runtime; the loop store the record agrees with is agent-writable
+by design, so this file is the one factor a forged loop cannot supply. Only the
+gateway opens it (authorizer, fire-time guard, member route, the store's remove),
+and a record an upgraded install still has at the `trust/` layout is DISCARDED on
+the gateway's first access, never migrated — that file sat in a sandbox-writable
+directory, so a forged entry in it cannot be told from a real one; the loops
+behind it are refused at fire time (audited) until armed again. The mask says
+nothing about bytes planted at the NEW path before the boot that first masked it,
+so the record is also SEALED: an HMAC over its entries under `token_signing.key`
+(masked and fenced in every build that ships it), which a plant cannot mint.
+Unsealed content reads as nothing recorded and the next writer moves it aside;
+a token-key rotation breaks the seals the same way, and the loops are armed again.
+
 The MASKED leaves are a separate population with a separate pass.
 `sandbox._refuse_aliased_masked_leaves` refuses a SYMLINK at every entry in
 `_CREW_HIDDEN_LEAVES` except the ones in `_CREW_ALIAS_TOLERATED_LEAVES`, and it runs last
