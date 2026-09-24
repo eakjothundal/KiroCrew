@@ -280,6 +280,22 @@ class SessionLifecycleState:
     # outstanding change stays its own trigger for the next turn.
     identity_sweep_fingerprint: str = ""
     recycling: dict[str, _SessionEntry] = field(default_factory=dict)
+    # Folded key -> the session ``reset`` popped under it, for exactly the life of
+    # that teardown. ``reset`` pops the session out of the live map under the
+    # registry lock BEFORE the awaits that can hang (the end record, the unlink,
+    # the child probes, the provider shutdown), so from the pop to the end of the
+    # teardown the map does not name the process the teardown holds. A reader
+    # that must still reach it -- the cron reaper, killing a run whose OWN finally
+    # reset popped the session and then hung, the ordinary shape of a run that
+    # hangs in its teardown -- reads it here through
+    # :meth:`SessionLifecycleService.tearing_down`. Recorded in the same lock
+    # hold as the pop and released when the teardown ends however it ends
+    # (return, a raised shutdown error, a cancellation landing on the hung
+    # shutdown), by the :class:`_TeardownScope` the facade opens around every
+    # ``reset``. Bounded: one entry per key, held by the FIRST teardown to pop
+    # under that key until it ends -- see the scope for why a later popper does
+    # not replace it.
+    tearing_down: dict[str, _SessionEntry] = field(default_factory=dict)
     suppress_replay: set[str] = field(default_factory=set)
     origin_links: dict[str, Any] = field(default_factory=dict)
     on_recycled: _RecycleCallback | None = None
@@ -338,6 +354,84 @@ class _ReplayGap:
     closed: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+class _TeardownScope:
+    """One ``reset`` call's hold on the ``tearing_down`` entry it records at its pop.
+
+    The facade opens a scope around every ``reset`` and hands it in; ``reset``
+    records the session it pops into the scope in the same lock hold as the pop,
+    and the scope's exit releases the entry. The release is the scope's and not a
+    ``finally`` inside ``reset`` because the pop sits under the registry lock at
+    the top of a teardown whose awaits span the rest of that method: the hold has
+    to outlive every one of them, which a caller-side ``with`` does without
+    re-indenting the teardown. A ``reset`` called with no scope records nothing.
+
+    Bounded: one entry per key. A key has one live session to pop, and the FIRST
+    teardown to pop under a key holds the entry until it ends. A later reset that
+    pops a successor registered under the same key while that teardown is still
+    in flight records nothing: the successor is not the process the earlier
+    teardown holds, and a reader asking after the run's process must get the
+    popped one, not whatever replaced it. Its scope then releases nothing it did
+    not record, so the first teardown's entry outlives it, and is removed by
+    identity when that teardown ends -- return, raise or cancellation alike.
+
+    The scope also answers a question the table cannot: which session did THIS
+    reset pop? A caller that resets a key and then has to kill what the reset
+    could not stop (the cron reaper, when its own reset times out) cannot learn
+    that from a snapshot taken before the reset -- a cold start can register a
+    new session under the key between the snapshot and the pop, and it is that
+    session the reset pops and then hangs on. So ``popped`` is set at the pop for
+    every pop (not only the first popper's) and survives ``release``, and a
+    caller-supplied ``on_pop`` runs in the same lock hold as the pop, so whatever
+    it reads off the session (a process handle) is read atomically with the pop
+    and before any await that could lose it.
+    """
+
+    __slots__ = ("_table", "_key", "_session", "_on_pop", "popped")
+
+    def __init__(
+        self,
+        table: dict[str, _SessionEntry],
+        on_pop: Callable[[_SessionEntry], None] | None = None,
+    ) -> None:
+        self._table = table
+        self._key: str | None = None
+        self._session: _SessionEntry | None = None
+        self._on_pop = on_pop
+        #: The session the ``reset`` this scope wrapped popped, or None when it
+        #: popped nothing (no session under the key, or the reset declined).
+        self.popped: _SessionEntry | None = None
+
+    def note_pop(self, key: str, session: _SessionEntry) -> None:
+        """Record the session ``reset`` is popping under *key*, in the same lock hold as the pop."""
+        self.popped = session
+        self.retain(key, session)
+        if self._on_pop is not None:
+            self._on_pop(session)
+
+    def retain(self, key: str, session: _SessionEntry) -> None:
+        """Record *session* as the one being torn down under *key*, unless one already is."""
+        if self._table.setdefault(key, session) is session:
+            self._key = key
+            self._session = session
+
+    def release(self) -> None:
+        """Drop the entry this scope recorded; an entry another scope holds is left alone.
+
+        ``popped`` is deliberately kept: it is the caller's record of what its
+        reset did, not the table's.
+        """
+        if self._key is not None and self._table.get(self._key) is self._session:
+            del self._table[self._key]
+        self._key = None
+        self._session = None
+
+    def __enter__(self) -> "_TeardownScope":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
 def _turn_in_flight(session: Any, *, refuse_only_on_active_turn: bool = False) -> bool:
     """Whether *session* is busy, as this caller's ``skip_if_busy`` means it.
 
@@ -387,6 +481,29 @@ class SessionLifecycleService:
     @_identity_sweep_lock.setter
     def _identity_sweep_lock(self, lock: asyncio.Lock) -> None:
         self.state.identity_sweep_lock = lock
+
+    def teardown_scope(
+        self, on_pop: Callable[[_SessionEntry], None] | None = None
+    ) -> _TeardownScope:
+        """A hold on the ``tearing_down`` entry the ``reset`` it is handed to records.
+
+        Opened by the facade around every ``reset`` (``with``), so the entry is
+        released when the teardown ends however it ends; see :class:`_TeardownScope`.
+        A caller that must know exactly which session its reset popped -- and read
+        something off it atomically with the pop -- opens the scope itself, passes
+        ``on_pop``, hands the scope to ``reset`` and reads ``scope.popped`` after.
+        """
+        return _TeardownScope(self.state.tearing_down, on_pop)
+
+    def tearing_down(self, key: str) -> _SessionEntry | None:
+        """The session a ``reset`` popped under *key* whose teardown has not ended, else None.
+
+        The live map stops naming a session at the pop, before the teardown's
+        awaits; a reader that must still reach that session's process (the cron
+        reaper, after a run's own finally reset popped the session and hung)
+        reads it here for exactly the life of the teardown.
+        """
+        return self.state.tearing_down.get(self._owner._fold_key(key))
 
     def stop_generation(self, key: str) -> int:
         """How many Stop requests have been recorded for *key*.
@@ -743,6 +860,7 @@ class SessionLifecycleService:
         refuse_only_on_active_turn: bool = False,
         clear_conversation: bool = False,
         ends_conversation: bool = False,
+        scope: _TeardownScope | None = None,
     ) -> bool:
         """Kill a live session while preserving the exact reset semantics.
 
@@ -754,6 +872,14 @@ class SessionLifecycleService:
         re-prompt. Those must NOT stop this parent's sub-agent runs: the child has a
         conversation to deliver into and is bounded by its own run timeout, so stopping it
         would discard live work belonging to a conversation that is coming back.
+
+        ``scope`` is the caller's hold on the ``tearing_down`` entry this reset records
+        at its pop (:class:`_TeardownScope`): the popped session stays readable through
+        :meth:`tearing_down` until the scope is released, which the facade does when this
+        call ends however it ends. Without a scope nothing is recorded, and the popped
+        session is unreachable from the pop on -- a reader that arrives after it (the
+        cron reaper, when the run's own finally reset popped the session and hung)
+        then has no handle to the process this teardown holds.
 
         ``ends_conversation=True`` says the caller is ending the conversation, not
         recycling it, and then this parent's runs are stopped like any other parent end.
@@ -813,6 +939,19 @@ class SessionLifecycleService:
                     injecting = True
                 if injecting:
                     return False
+            # Recorded in the same lock hold as the pop and before it (``current`` is
+            # what the pop removes: no await separates the two reads): from the pop
+            # to the end of this method the live map does not name this session,
+            # and every await below (the end record, the unlink, the child probes,
+            # the provider shutdown) is where a teardown hangs. The scope keeps the
+            # popped session readable through ``tearing_down`` for exactly the life
+            # of this call -- the facade releases it when this method ends, however
+            # it ends -- and tells the caller which session THIS reset popped (its
+            # ``popped``, and its ``on_pop`` hook, run here so a caller's read of the
+            # session is atomic with the pop). One table entry per key, the first
+            # popper's; no scope, no record.
+            if scope is not None and current is not None:
+                scope.note_pop(key, current)
             session = owner._sessions.pop(key, None)
             # Snapshotted in the SAME lock hold as the pop, and only when the caller says
             # the conversation is ending: every await below is a window a cold start can
