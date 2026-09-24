@@ -56,6 +56,8 @@ from kiro_crew.dashboard.chat_delivery import (
 from kiro_crew.dashboard.chat_folders import (
     _resolve_folder_project_dir,
     _unhide_folder,
+    execution_principal,
+    project_dir_unc_refusal,
 )
 from kiro_crew.dashboard.chat_orchestrator import (
     _cancel_stage_subagents,
@@ -170,6 +172,11 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.dashboard.system_notices import SESSION_RELOAD_KIND, is_system_notice
 from kiro_crew.dashboard.turn_dispatch import spawn_guarded_turn
+from kiro_crew.execution_context import (
+    ExecutionContext,
+    MemoryStoreRef,
+    resolve_member_execution,
+)
 from kiro_crew.history import carry_provenance, is_incognito_transcript, transcript_stems
 from kiro_crew.llm_helpers import pick_epoch_host, slot_switch_session_lock
 from kiro_crew.memory_startup import MemoryStartupUnavailable, wait_for_memory_preparation
@@ -2890,14 +2897,25 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
             },
             status=409,
         )
-    folder_project = ""
     if folder_id and (existing_slot is None or not existing_slot.project):
-        folder_snapshot = await state.read_folders(
-            lambda folders: [dict(folder) for folder in folders]
-        )
-        folder_project, folder_project_error = await asyncio.to_thread(
-            _resolve_folder_project_dir, folder_snapshot, folder_id
-        )
+        # Delivery is owner-scoped (``_binding_reaches``): a binding a crew
+        # member's folder stores reaches only a chat running AS that member.
+        # This PRE-FLIGHT answers for the CALLER's principal -- the person (no
+        # principal) or the app whose claim ``get_or_create_slot`` stamps on
+        # the slot as ``_app`` -- and only its error side is used: an invalid
+        # stored path on the requested folder's chain refuses the create HERE,
+        # before the peer write and the mint, with nothing to unwind. The
+        # value that lands on the slot is resolved again at the commit below
+        # (``_slot_folder_project``), against the folder the slot HOLDS by then
+        # and for the principal it runs as -- the caller's, or the crew member
+        # an owner request selects (``agent_kind: member``), whom a
+        # member-bound folder reaches from the first turn. A member is not
+        # admitted to this route (its own workers are born through
+        # ``session_control.create_session``), so a member-bound folder confers
+        # nothing on a slot made here except through that selection, and the
+        # person's chat opened in a member's folder from the sidebar takes the
+        # nearest PERSON binding above it or the workspace default.
+        _, folder_project_error = await _resolve_folder_project(state, folder_id, request_app)
         if folder_project_error:
             return web.json_response(
                 {
@@ -3077,6 +3095,11 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
     # as the agent's: `resolve_agent_bindings` answers from THIS machine's
     # bindings, so a peer agent name would resolve to a local workspace (or to
     # nothing, logging a false "does not resolve"). The peer resolves its own.
+    #
+    # Kept past the block: the folder-binding commit below reads the selection
+    # this create records off these bindings. ``None`` -- no agent, a peer-bound
+    # create, a failed resolution -- reads as no member pick.
+    bindings: ResolvedBindings | None = None
     if cfg is not None and agent and not instance_id:
         resolving_key = _normalize_slot_key(str(name)) if name else ""
         resolving_slot = state._slots.get(resolving_key) if resolving_key else None
@@ -3152,6 +3175,51 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
                 {"error": "slot changed during agent resolution", "code": "session_rebound"},
                 status=409,
             )
+    if (
+        folder_id
+        and cfg is not None
+        and bindings is not None
+        and not instance_id
+        and existing_slot is None
+        and is_owner_dashboard_request(request)
+    ):
+        # The SELECTED principal's pre-flight, beside the caller's above. An
+        # owner request that opens the chat AS a crew member (``agent_kind:
+        # member``) is delivered that member's row on the requested folder's
+        # chain from the first turn (``_binding_reaches``), and the caller's
+        # pre-flight never looked at that row (it does not reach the person).
+        # So the chain is resolved once more for the principal the chat will
+        # run as -- spelled from the request's fields exactly as the commit
+        # below will spell it from the slot's (``_requested_principal``) --
+        # and a row that fails validation (its directory deleted, renamed
+        # or now sensitive) refuses the create HERE, before the mint, with the
+        # code the person's chain gets: the alternative was a chat minted and
+        # silently scoped to the workspace default while the member's binding
+        # stood in the store. Only a principal other than the caller's is
+        # re-asked; a template pick, or a selection with no buildable
+        # execution, reads as the caller and was answered above. A slot that
+        # already exists takes no selection at the commit (``is_new_slot``), so
+        # it takes none here.
+        selected_principal = await _requested_principal(
+            cfg,
+            agent,
+            bindings,
+            memory_mode=memory_mode,
+            app=request_app,
+            key=str(name or "(new)"),
+        )
+        if selected_principal and selected_principal != request_app:
+            _, folder_project_error = await _resolve_folder_project(
+                state, folder_id, selected_principal
+            )
+            if folder_project_error:
+                return web.json_response(
+                    {
+                        "error": f"invalid folder project: {folder_project_error}",
+                        "code": "folder_project_invalid",
+                    },
+                    status=400,
+                )
     # An adopted slot's `workspace` field is the PEER's, read off its row, in
     # place of the create default the peer-bound branch above skipped resolving.
     # Same terms as `agent`: it is a mirror of what the crew committed for a
@@ -3402,8 +3470,53 @@ async def api_chat_slot_create(request: web.Request) -> web.Response:
         # server owns this fallback because the client folder cache can be
         # temporarily stale; existing named slots with an explicit project keep
         # it and continue to use the project endpoint for scope changes.
-        if folder_project and folder_applied and not slot.project:
-            slot.project = folder_project
+        if folder_applied and not slot.project:
+            # Resolved HERE, at the commit, for the folder the slot HOLDS and the
+            # principal it runs AS -- never the pre-flight's value, which
+            # answered for the folder the caller asked for and for the caller.
+            # The two differ exactly when it matters: an owner request that
+            # opens the chat AS a crew member (``agent_kind: member``, recorded
+            # below), whom a member-bound folder reaches (``_binding_reaches``)
+            # from its first turn -- decided from the bindings the record
+            # commits (``_selection_principal``), under the record's own
+            # conditions (an owner request, a local create), so an app's slot
+            # and a peer-bound one resolve for the caller's principal; and a
+            # slot a concurrent writer refiled during the awaits above, whose
+            # project must describe where it now sits, not where it was asked
+            # to go. ``_slot_folder_project`` hands back an answer only while
+            # the slot still holds the folder it was resolved for, so the write
+            # right after it lands on the folder it describes. A row that fails
+            # validation withholds, with a warning, and the workspace default
+            # lands -- both the caller's chain and the selected member's row
+            # were validated before the mint (the two pre-flights above), so
+            # by now it can only be a row that changed inside this request or
+            # a destination the refile chose -- not a 400, which would leave
+            # the minted slot behind with no project at all. Nothing else is
+            # written: the filing the refile gave the slot stands, and the
+            # folder store is not touched.
+            member_principal = ""
+            if (
+                is_new_slot
+                and cfg is not None
+                and not instance_id
+                and bindings is not None
+                and is_owner_dashboard_request(request)
+            ):
+                member_principal = await _selection_principal(slot, cfg, agent, bindings)
+            folder_project, folder_project_error = await _slot_folder_project(
+                state, slot, member_principal or request_app
+            )
+            if folder_project_error:
+                logger.warning(
+                    "slot %s: folder %s binding for %s does not validate (%s); "
+                    "the workspace default is kept",
+                    slot.key,
+                    slot.folder_id,
+                    member_principal or request_app or "the person",
+                    folder_project_error,
+                )
+            elif folder_project and not slot.project:
+                slot.project = folder_project
         # Default project to workspace directory so file search works out of the box
         if not slot.project:
             cfg_proj = cfg.dashboard.default_project if cfg else ""
@@ -7120,6 +7233,169 @@ async def _apply_remote_pick_locked(
     return web.json_response({"ok": True, control: value, "remote": True})
 
 
+def _selection_execution(
+    config: KiroCrewConfig,
+    agent_name: str | None,
+    bindings: ResolvedBindings,
+    *,
+    memory_mode: str,
+    app: str,
+) -> ExecutionContext:
+    """The execution an agent selection binds, built from the selection alone.
+
+    One constructor for two readers. :func:`_record_explicit_agent_selection`
+    PUBLISHES this into the session's record; the folder-binding readers on the
+    create and agent-switch routes read it BEFORE that record exists, because
+    what a member-bound folder confers (``chat_folders._binding_reaches``) is
+    decided by the principal the slot will run AS once the selection lands, and
+    the record still says what the slot ran as until now -- nothing, or the
+    person. Read off the prior record, the FIRST pick of a crew member in its
+    own bound folder resolved as the person, skipped the member's binding and
+    committed the workspace default as the directory of the member's first
+    turn; only a second, same-name reset landed the member's directory. Derived
+    from the same ``bindings`` and the same inputs the publication uses, so the
+    two spellings cannot drift.
+    """
+    selected = agent_name or bindings.resolved_alias
+    if bindings.selection_kind == "member":
+        return resolve_member_execution(
+            config, selected, memory_mode=memory_mode, app=app, validate_memory_files=False
+        )
+    return ExecutionContext(
+        None,
+        MemoryStoreRef(bindings.memory_store_name or "default"),
+        "template",
+        bindings.kiro_agent,
+        memory_mode,
+        app=app,
+        selection_name=selected,
+    )
+
+
+async def _selection_principal(
+    slot: Any,
+    config: KiroCrewConfig,
+    agent_name: str | None,
+    bindings: ResolvedBindings,
+) -> str:
+    """The ``owner_app``-alphabet principal *slot* runs AS once *bindings* lands.
+
+    :func:`_requested_principal` over the slot's own fields -- the commit-side
+    spelling, kept as its own awaited step because the create path's commit and
+    the agent switch both read it right before a write.
+    """
+    return await _requested_principal(
+        config,
+        agent_name,
+        bindings,
+        memory_mode=slot.memory_mode,
+        app=str(slot._app or ""),
+        key=str(slot.key),
+    )
+
+
+async def _requested_principal(
+    config: KiroCrewConfig,
+    agent_name: str | None,
+    bindings: ResolvedBindings,
+    *,
+    memory_mode: str,
+    app: str,
+    key: str,
+) -> str:
+    """The ``owner_app``-alphabet principal a chat selecting *agent_name* under
+    *bindings* runs AS -- from request fields, so the create route can ask it
+    BEFORE the slot exists.
+
+    ``execution_principal`` over :func:`_selection_execution` -- the app first,
+    then ``member:<store>`` for a member pick, ``""`` for a template -- which is
+    what the folder-binding readers hand ``_resolve_folder_project_dir`` as
+    ``slot_app``. A selection whose execution cannot be built (the member's
+    store is gone, its declaration malformed) reads as the PERSON: the least any
+    chat is delivered, so a failure here can only withhold a member's binding
+    from the member's own slot, never hand it to someone else's -- and the
+    publication of the same selection fails loudly on the same error. *key*
+    names the slot (or the one about to be minted) in the log line only.
+    """
+    try:
+        execution: ExecutionContext | None = await asyncio.to_thread(
+            _selection_execution,
+            config,
+            agent_name,
+            bindings,
+            memory_mode=memory_mode,
+            app=app,
+        )
+    except Exception:
+        logger.debug(
+            "slot %s: selection %r has no buildable execution; folder binding read as the person",
+            key,
+            agent_name,
+            exc_info=True,
+        )
+        execution = None
+    return execution_principal(app, execution)
+
+
+async def _resolve_folder_project(
+    state: DashboardState, folder_id: str, principal: str
+) -> tuple[str, str | None]:
+    """One folder-store snapshot and one off-loop resolve of *folder_id* for a
+    chat running as *principal* -- this module's ONLY call of
+    :func:`_resolve_folder_project_dir`, so every reader takes the snapshot
+    under the store's own read and runs ``realpath``/``isdir`` off the loop, as
+    the resolver's contract requires. The answer describes *folder_id* as the
+    store held it at the snapshot; whether the slot it is meant for still sits
+    in that folder is :func:`_slot_folder_project`'s question, and a caller
+    that resolves for a slot not yet minted (the create pre-flight) uses only
+    the error side of the answer.
+    """
+    folder_snapshot = await state.read_folders(lambda folders: [dict(folder) for folder in folders])
+    return await asyncio.to_thread(
+        _resolve_folder_project_dir, folder_snapshot, folder_id, slot_app=principal
+    )
+
+
+async def _slot_folder_project(
+    state: DashboardState, slot: Any, principal: str
+) -> tuple[str, str | None]:
+    """The project the folder *slot* CURRENTLY sits in confers on a chat running
+    as *principal* -- the ONE place a slot's folder binding is resolved for a
+    commit, shared by the create path and the agent switch.
+
+    Two awaits stand between reading the folder id and having an answer -- the
+    folder-store snapshot and the off-loop resolve (:func:`_resolve_folder_project`)
+    -- and a concurrent writer can refile the slot inside them (``PATCH
+    /api/chat/slots/{slot}/folder``, a channel filing, a folder delete), so an
+    answer is handed back ONLY when the slot still holds the folder it was
+    resolved for when the resolve completed. Otherwise the answer is discarded
+    -- it describes a folder other than the one this slot holds -- and the resolve
+    is retried once against the folder the slot now holds; a slot refiled faster
+    than that, or unfiled meanwhile, has no stable answer and gets ``("", None)``:
+    nothing to commit. The caller commits a non-empty first element with NO
+    await in between (the check here is the commit-time check), and only that:
+    a value resolved earlier in a request -- a pre-flight for the folder the
+    caller ASKED for, a read for another principal -- is never what lands, so
+    no arm's refusal and no refile can leave an earlier answer to write. A row
+    that fails validation comes back as the error string with ``""`` beside it,
+    for the caller to withhold on (a warning and the workspace default);
+    :func:`_binding_reaches` inside the resolver is what keeps a member's or an
+    app's binding from reaching a chat that does not run as that principal
+    (owner-scoped delivery).
+    """
+    for _attempt in range(2):
+        folder_id = str(slot.folder_id or "")
+        if not folder_id:
+            return "", None
+        project, error = await _resolve_folder_project(state, folder_id, principal)
+        if slot.folder_id == folder_id:
+            return project, error
+        # Refiled mid-resolve: what came back describes a folder other than the
+        # one this slot now holds. Discarded, never committed; one retry against
+        # the live folder is enough for a refile that has already landed.
+    return "", None
+
+
 async def _record_explicit_agent_selection(
     session_key: str,
     agent_name: str | None,
@@ -7130,27 +7406,9 @@ async def _record_explicit_agent_selection(
     app: str = "",
 ) -> SelectionChange | None:
     """Capture the admitted choice and drain publication before cancellation."""
-    from kiro_crew.execution_context import (
-        ExecutionContext,
-        MemoryStoreRef,
-        resolve_member_execution,
+    bindings.execution_context = _selection_execution(
+        config, agent_name, bindings, memory_mode=memory_mode, app=app
     )
-
-    selected = agent_name or bindings.resolved_alias
-    if bindings.selection_kind == "member":
-        bindings.execution_context = resolve_member_execution(
-            config, selected, memory_mode=memory_mode, app=app, validate_memory_files=False
-        )
-    else:
-        bindings.execution_context = ExecutionContext(
-            None,
-            MemoryStoreRef(bindings.memory_store_name or "default"),
-            "template",
-            bindings.kiro_agent,
-            memory_mode,
-            app=app,
-            selection_name=selected,
-        )
     writer = asyncio.create_task(
         asyncio.to_thread(
             record_agent_selection,
@@ -7647,35 +7905,40 @@ async def api_chat_slot_agent(request: web.Request) -> web.Response:
                 folder_project = ""
                 if slot.folder_id:
                     try:
-                        # REVALIDATED against the id the snapshot was taken
-                        # for. `read_folders` and the off-loop resolve are two
-                        # awaits, and a concurrent assignment can file this
-                        # slot into a folder CREATED after the snapshot -- whose
-                        # id is then absent from it, resolving to nothing and
-                        # committing the workspace default as this chat's
-                        # directory. One retry is enough for an assignment that
-                        # has already landed; a slot being reassigned faster
-                        # than that has no stable answer to commit, so it keeps
-                        # the documented fall-through.
-                        folder_error: str | None = ""
-                        for _ in range(2):
-                            folder_id_at_read = slot.folder_id
-                            if not folder_id_at_read:
-                                break
-                            folder_snapshot = await state.read_folders(
-                                lambda folders: [dict(folder) for folder in folders]
-                            )
-                            folder_project, folder_error = await asyncio.to_thread(
-                                _resolve_folder_project_dir,
-                                folder_snapshot,
-                                folder_id_at_read,
-                            )
-                            if slot.folder_id == folder_id_at_read:
-                                break
-                            # Reassigned mid-resolve: what came back describes a
-                            # folder other than the one this slot now holds, so
-                            # it is discarded rather than committed.
-                            folder_project, folder_error = "", ""
+                        # Delivery is owner-scoped (``_binding_reaches``): a
+                        # binding a crew member's folder stores reaches this
+                        # slot only if the slot RUNS AS that member -- the
+                        # principal of the selection being COMMITTED, not of
+                        # the record the slot carried until now. The two
+                        # differ exactly once: the first pick of a member on a
+                        # chat that ran as the person, whose record (if any)
+                        # names nobody, so read off the record the member's
+                        # own binding was skipped and the workspace default
+                        # committed as its first turn's directory. A pinned
+                        # member session cannot pick a different agent
+                        # (refused above), and a same-name reset re-selects
+                        # the same member, so for every other switch the two
+                        # agree. Spelled by ``slot_steering_principal`` over
+                        # the execution ``_record_explicit_agent_selection``
+                        # publishes below, from the same ``bindings``; a
+                        # selection with no buildable execution reads as the
+                        # PERSON, the least any chat is delivered.
+                        slot_principal = await _selection_principal(slot, cfg, agent_name, bindings)
+                        # Resolved for the folder the slot HOLDS when the resolve
+                        # completes (``_slot_folder_project``, the one owner of
+                        # this read for both readers): `read_folders` and the
+                        # off-loop resolve are two awaits, and a concurrent
+                        # assignment can refile this slot inside them -- into a
+                        # folder CREATED after the snapshot, whose id is then
+                        # absent from it and resolves to nothing, or into any
+                        # other -- so an answer for a folder the slot does not now
+                        # sit in is discarded, one retry covers an assignment
+                        # that has already landed, and a slot reassigned faster
+                        # than that has no stable answer and keeps the
+                        # documented fall-through.
+                        folder_project, folder_error = await _slot_folder_project(
+                            state, slot, slot_principal
+                        )
                         if folder_error:
                             # Deliberately NOT the create path's 400: that
                             # validator also rejects a directory that no
@@ -10219,6 +10482,22 @@ async def api_chat_slot_project(request: web.Request) -> web.Response:
     if denied is not None:
         return denied
     if project:
+        # Lexical, before ``realpath``: a UNC-shaped project makes a Windows
+        # gateway's ``realpath`` open an SMB connection to a host the caller
+        # named. The folder endpoint's own helper decides -- one rule for every
+        # site where request-named path text is admitted (the folder routes,
+        # the set_project directive, this endpoint) -- in that validator's 400
+        # shape, audited like the sensitive-path refusal below.
+        unc_err = project_dir_unc_refusal(project)
+        if unc_err:
+            sel().log_api_access(
+                caller=request.get("user", "dashboard"),
+                operation="chat_slot_project",
+                outcome="denied",
+                resources=f"slot={name} project={project}",
+                error="UNC path",
+            )
+            return web.json_response({"error": unc_err, "code": "project_unc_path"}, status=400)
         project = os.path.realpath(os.path.expanduser(project))
         if not os.path.isdir(project):
             return web.json_response({"error": "Not a directory"}, status=400)

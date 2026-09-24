@@ -14976,7 +14976,7 @@ class TestFolderCRUD:
     async def test_create_folder_with_project_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
-        app = _make_folder_app(state)
+        app = _make_folder_app(state, dashboard_user=True)
         proj = tmp_path / "proj"
         proj.mkdir()
         async with TestClient(TestServer(app)) as client:
@@ -14991,7 +14991,7 @@ class TestFolderCRUD:
     async def test_create_folder_relative_project_dir_rejected(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
-        app = _make_folder_app(state)
+        app = _make_folder_app(state, dashboard_user=True)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
                 "/api/chat/folders", json={"name": "P", "project_dir": "relative/path"}
@@ -15002,7 +15002,7 @@ class TestFolderCRUD:
     async def test_create_folder_nonexistent_project_dir_rejected(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
-        app = _make_folder_app(state)
+        app = _make_folder_app(state, dashboard_user=True)
         missing = tmp_path / "does-not-exist"
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
@@ -15014,7 +15014,7 @@ class TestFolderCRUD:
     async def test_create_folder_sensitive_project_dir_rejected(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
-        app = _make_folder_app(state)
+        app = _make_folder_app(state, dashboard_user=True)
         async with TestClient(TestServer(app)) as client:
             resp = await client.post(
                 "/api/chat/folders", json={"name": "P", "project_dir": "~/.ssh"}
@@ -15027,7 +15027,7 @@ class TestFolderCRUD:
     async def test_update_folder_project_dir(self, tmp_path, monkeypatch):
         monkeypatch.setattr("kiro_crew.dashboard.state.config_dir", lambda: tmp_path)
         state = _make_state(tmp_path)
-        app = _make_folder_app(state)
+        app = _make_folder_app(state, dashboard_user=True)
         proj = tmp_path / "proj2"
         proj.mkdir()
         async with TestClient(TestServer(app)) as client:
