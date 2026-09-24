@@ -10,6 +10,11 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+# The MODULE, not its names: the proof producers stay behind a path the argv
+# floor's credential-mint rule reads (``queue_origin_token``); re-exporting them
+# here would put a mint under a path that rule does not cover.
+from kiro_crew.dashboard import queue_origin_token
+
 logger = logging.getLogger(__name__)
 
 # This is well above the slot queue's legitimate in-flight set.  Eviction only
@@ -68,6 +73,158 @@ MAX_DURABLE_QUEUE_SCAN = 4 * MAX_DURABLE_QUEUE_ENTRIES
 #: consumer asks instead of trying to tell the two apart from the actor alone.
 RESTORED_QUEUE_KEY = "_restored_from_disk"
 
+#: Field of the DURABLE queue record (the persisted ``queued_prompts`` line, not
+#: the live entry) carrying the gateway's own attestation of the entry's
+#: PROVENANCE: where it came from -- the dashboard (the composer, an app, a
+#: recovery of a dashboard turn) or a named channel conversation that handed it
+#: off -- and the containment that held when it was accepted. It is the one
+#: provenance a restored entry may carry across a restart, because it is the one
+#: provenance a restart cannot forge: an HMAC over the slot key, the queue id,
+#: the content, the entry's channel address (``channel_busy``'s stamp; none for
+#: dashboard text) and its admission-time containment snapshot, keyed from the
+#: gateway's fenced signing secret (``token_signing.key``, which no agent file
+#: tool can read or write), under its own domain tag so a queue proof is never
+#: also a valid auth token (:mod:`kiro_crew.dashboard.queue_origin_token`).
+#:
+#: The rule it serves is DEFAULT DENY, in three parts. A restored entry carries no
+#: command authority: the drain treats it as channel text -- no composer command
+#: word, a leading ``/workflow`` refused with the usual notice -- unless an
+#: ADDRESS-LESS proof verifies against it (:func:`dashboard_origin_proven`). It
+#: carries no admission snapshot -- it is re-checked against every constraint
+#: that holds NOW, and on a linked or mirrored slot that drops it -- unless the
+#: proof verifies over the snapshot the record carries. And it names no channel
+#: conversation -- a released binding neither drops nor reports it -- unless the
+#: proof verifies over the address the record carries. All three are read back
+#: by :func:`restore_queue_provenance` from one verification, so a persisted
+#: entry can be edited in any way an editor likes (its stamps removed or
+#: rewritten, its content rewritten, a proof transplanted from another entry or
+#: slot) and comes back as unproven prose that fails closed; a dashboard entry
+#: keeps its command word and its admission through a restart because its proof
+#: still verifies; and a channel hand-off comes back exactly as it was queued --
+#: channel text, bound to the conversation that sent it, admitted under the
+#: containment it was accepted with -- so an entry whose binding still holds
+#: drains and one whose binding changed is dropped WITH the notice to its
+#: sender. Compare :data:`RESTORED_QUEUE_KEY`: that key says the entry was
+#: restored, this one says what the gateway knew about it when it was accepted.
+#:
+#: Live, the proof lives BESIDE the queue -- ``owner._origin_proofs``, keyed by
+#: queue id, like ``_last_enqueue_ts`` -- and never on the entry: queue dicts are
+#: compared wholesale on the wire and across the suite (the facade hands back the
+#: caller's own ``meta`` object), so the board and every ``to_dict`` projection
+#: see exactly what was enqueued. The durable writer joins the proof onto the
+#: record it emits (the address and the snapshot already ride the record inside
+#: ``meta``) and the restore verifies it and lifts it back into the sidecar.
+ORIGIN_PROOF_KEY = "origin_proof"
+
+
+def _origin_proofs_of(owner: Any) -> dict[str, str]:
+    """The owner's proof sidecar, created on first use for a bare test double."""
+    proofs = getattr(owner, "_origin_proofs", None)
+    if not isinstance(proofs, dict):
+        proofs = {}
+        owner._origin_proofs = proofs
+    return proofs
+
+
+def _provenance_parts(meta: Any) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """The two signed parts of an entry's ``meta``: its channel address and its
+    admission-time containment snapshot, each ``None`` unless a mapping.
+
+    Read off untrusted plumbing (a live entry's meta, or a durable record's), so
+    any other shape is "absent" -- and absent is what the proof is then computed
+    over, which is why a stamp hand-written as anything but a mapping verifies
+    as nothing rather than as a stamp.
+    """
+    if not isinstance(meta, dict):
+        return None, None
+    # Local import: session_control reaches this module through state, and
+    # channel_busy through chat_delivery, so taking either key at module level
+    # would close an import cycle.
+    from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+    from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
+
+    address = meta.get(CHANNEL_ORIGIN_META_KEY)
+    admission = meta.get(QUEUED_CONTAINMENT_META_KEY)
+    return (
+        address if isinstance(address, dict) else None,
+        admission if isinstance(admission, dict) else None,
+    )
+
+
+def dashboard_origin_proven(owner: Any, entry: Any) -> bool:
+    """Whether *entry* of *owner*'s queue carries the gateway's proof of DASHBOARD
+    origin: the proof over the entry as it stands (owner key, id, content, its
+    admission snapshot) and NO channel address.
+
+    Read from the sidecar by the entry's id. False for a missing proof, a
+    rewritten content or snapshot, a proof moved between entries or slots, a
+    non-string tag -- and for a channel hand-off, whose proof is over its
+    address and so never verifies as address-less. Never raises.
+    """
+    if not isinstance(entry, dict):
+        return False
+    entry_id = entry.get("id")
+    if not isinstance(entry_id, str):
+        return False
+    proofs = getattr(owner, "_origin_proofs", None)
+    tag = proofs.get(entry_id) if isinstance(proofs, dict) else None
+    address, admission = _provenance_parts(entry.get("meta"))
+    if address is not None:
+        # A channel hand-off is not dashboard text, whatever its proof says.
+        return False
+    return queue_origin_token.queue_provenance_matches(
+        str(getattr(owner, "key", "") or ""), entry_id, entry.get("content"), None, admission, tag
+    )
+
+
+def _stamp_origin(owner: Any, item: dict[str, Any], *, directive_channel_origin: bool) -> None:
+    """Record the provenance proof for *item* -- or withhold it.
+
+    Called at every point the repository accepts or rewrites an entry, because
+    the proof is over the content and the stamps beside it: an edit that changes
+    the words must re-sign them. Writes the owner's sidecar only -- never
+    ``item`` -- and prunes the sidecar down to the ids the queue holds, so a
+    consumed or removed entry does not leave its proof behind.
+
+    Only an entry a restart can hand back gets a proof -- a cron notice, a
+    recovery payload or a callback-bearing entry dies with its process. Channel
+    text whose entry names no conversation (``directive_channel_origin`` with no
+    address stamped) gets none either: the proof of a channel hand-off IS the
+    proof of its address, and channel text the gateway cannot place comes back
+    as unproven prose that fails closed, the pre-proof reading. A dashboard edit
+    of a stamped hand-off keeps the address on the entry, so its proof stays a
+    channel proof: restored, the edited words drain with channel authority, the
+    narrower of the two -- the one restart cost this design accepts.
+    """
+    proofs = _origin_proofs_of(owner)
+    queue = getattr(owner, "_queue", None) or ()
+    live = {entry.get("id") for entry in queue if isinstance(entry, dict)} | {item.get("id")}
+    for stale in [entry_id for entry_id in proofs if entry_id not in live]:
+        del proofs[stale]
+    entry_id = item.get("id")
+    if not isinstance(entry_id, str) or not entry_id:
+        return
+    if not _is_durable_queue_entry(item):
+        proofs.pop(entry_id, None)
+        return
+    address, admission = _provenance_parts(item.get("meta"))
+    if directive_channel_origin and address is None:
+        proofs.pop(entry_id, None)
+        return
+    try:
+        proofs[entry_id] = queue_origin_token.queue_provenance_proof(
+            str(getattr(owner, "key", "") or ""),
+            entry_id,
+            str(item.get("content") or ""),
+            channel_address=address,
+            admission=admission,
+        )
+    except (TypeError, ValueError):
+        # A stamp json cannot emit would also fail the durable write of this
+        # entry's meta; with no proof the entry restores as unproven prose.
+        proofs.pop(entry_id, None)
+
+
 _DURABLE_QUEUE_KEYS: tuple[str, ...] = (
     "id",
     "content",
@@ -109,7 +266,9 @@ def _is_durable_queue_entry(item: Any) -> bool:
     return True
 
 
-def durable_queue_entries(queue: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def durable_queue_entries(
+    queue: list[dict[str, Any]], proofs: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
     """The json-safe copies of *queue* a metadata writer may persist.
 
     Copies rather than aliases, so a later in-memory mutation cannot rewrite a
@@ -119,6 +278,12 @@ def durable_queue_entries(queue: list[dict[str, Any]]) -> list[dict[str, Any]]:
     entry without one fails closed into the full current-constraint set — so
     dropping it would make a restored prompt refusable for a boundary its
     author was never subject to.
+
+    *proofs* is the owner's origin-proof sidecar (``owner._origin_proofs``): an
+    entry it names gets the proof joined onto its RECORD as
+    :data:`ORIGIN_PROOF_KEY`, which is how the gateway's attestation reaches the
+    line without ever sitting on the live entry. The reader
+    (:func:`sanitize_restored_queue`) lifts it back into the sidecar.
 
     An entry whose ``meta`` cannot be serialized keeps its content and loses
     only the metadata, because the prompt is the part that cannot be
@@ -152,6 +317,9 @@ def durable_queue_entries(queue: list[dict[str, Any]]) -> list[dict[str, Any]]:
         entry_id = entry.get("id")
         if not isinstance(entry_id, str) or not entry_id:
             continue
+        proof = proofs.get(entry_id) if proofs else None
+        if isinstance(proof, str) and proof:
+            entry[ORIGIN_PROOF_KEY] = proof
         cost = len(json.dumps(entry))
         if cost > budget:
             continue
@@ -176,7 +344,12 @@ def count_durable_candidates(queue: list[dict[str, Any]]) -> int:
     return sum(1 for item in queue if _is_durable_queue_entry(item))
 
 
-def warn_if_not_durable(queue: list[dict[str, Any]], entry_id: str, slot_key: str) -> bool:
+def warn_if_not_durable(
+    queue: list[dict[str, Any]],
+    entry_id: str,
+    slot_key: str,
+    proofs: dict[str, str] | None = None,
+) -> bool:
     """Report an accepted prompt the durable write will not keep. True when kept.
 
     The bounds refuse to persist an entry past the count cap or the byte budget,
@@ -203,7 +376,7 @@ def warn_if_not_durable(queue: list[dict[str, Any]], entry_id: str, slot_key: st
     if not entry_id:
         return False
     snapshot = list(queue)
-    kept = durable_queue_entries(snapshot)
+    kept = durable_queue_entries(snapshot, proofs)
     if any(entry.get("id") == entry_id for entry in kept):
         return True
     candidates = count_durable_candidates(snapshot)
@@ -224,7 +397,9 @@ def warn_if_not_durable(queue: list[dict[str, Any]], entry_id: str, slot_key: st
     return False
 
 
-def durable_queue_view(queue: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+def durable_queue_view(
+    queue: list[dict[str, Any]], proofs: dict[str, str] | None = None
+) -> tuple[list[dict[str, Any]], int]:
     """The durable entries of *queue* and its candidate count, from ONE read.
 
     The shortfall the save reports is ``count - len(entries)``, and that
@@ -232,10 +407,13 @@ def durable_queue_view(queue: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
     separate reads of a LIVE queue makes an ordinary prompt that merely arrived
     between them look like one the bounds refused: the operator is then told a
     prompt exceeded the durable bounds when it is simply owed to the next save.
-    A list copy is what makes the pair one observation.
+    A list copy is what makes the pair one observation. *proofs* is the owner's
+    origin-proof sidecar, joined onto the records exactly as
+    :func:`durable_queue_entries` does, so the save's snapshot compares equal to
+    the writer's value.
     """
     snapshot = list(queue)
-    return durable_queue_entries(snapshot), count_durable_candidates(snapshot)
+    return durable_queue_entries(snapshot, proofs), count_durable_candidates(snapshot)
 
 
 def queue_persist_signature(entries: list[dict[str, Any]]) -> str:
@@ -281,8 +459,16 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
     not emit them either (:data:`_DURABLE_QUEUE_KEYS`); dropping them here is the
     reader's half of the same rule, so a hand-added flag buys nothing.
 
-    ``meta``'s admission-time containment snapshot goes the same way, and the
-    asymmetry there is sharper still. The drain's re-check
+    This reader is PURE and is the fail-closed half of a two-step restore: it
+    strips every provenance key, and :func:`restore_queue_provenance` -- given
+    the owner, whose key the proof is bound to -- puts back exactly the two the
+    gateway's own proof (:data:`ORIGIN_PROOF_KEY`, the record's own field)
+    verifies over: the admission snapshot and the channel address. A caller that
+    stops after this step restores every entry as unproven prose with no
+    admission and no address, the same fail-closed reading.
+
+    ``meta``'s admission-time containment snapshot is stripped here because the
+    asymmetry is sharp. The drain's re-check
     (``newly_held_constraints``) treats a constraint the entry recorded as
     already-held as "not a change", so an ABSENT snapshot fails closed against
     every currently-held constraint while a FORGED all-True one reports nothing
@@ -290,8 +476,9 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
     mirrored slot and republish to an audience its admission never contemplated.
     Stripping the key restores the fail-closed baseline: the entry is re-checked
     against the constraints that hold NOW, the only set this process can vouch
-    for. The rest of ``meta`` rides along, because it carries the sender's own
-    plumbing (``sendId``, attachments) that decides nothing about audience.
+    for -- unless the second step proves the snapshot is the one this gateway
+    recorded. The rest of ``meta`` rides along, because it carries the sender's
+    own plumbing (``sendId``, attachments) that decides nothing about audience.
 
     Capped at :data:`MAX_DURABLE_QUEUE_ENTRIES` entries and
     :data:`MAX_DURABLE_QUEUE_BYTES` of serialized content, the SAME two ceilings
@@ -314,6 +501,7 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
         return []
     # Local import: session_control reaches this module through state, so taking
     # the key at module level would close an import cycle.
+    from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
     from kiro_crew.dashboard.chat_delivery import TURN_ACTOR_META_KEY
     from kiro_crew.dashboard.session_control import (
         QUEUED_CONTAINMENT_META_KEY,
@@ -397,6 +585,19 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             # itself still survives -- which is what putting the stamp in
             # ``meta`` rather than a consumption callback buys, since a
             # callback-carrying entry is not persisted at all.
+            #
+            # The CHANNEL CONVERSATION stamp (``channel_busy``) goes for the
+            # same reason and names a write target of the same kind: the drain
+            # resolves the recipient of its channel drop notice from this key
+            # alone and sends to whatever allow-listed conversation it names,
+            # from a slot that need never have been bound to it. Nothing IN THE
+            # ENTRY can attest to the binding, so the key is worth what the file
+            # is worth here. Unlike the sender stamp, though, the gateway signed
+            # this one -- with the containment snapshot -- when it accepted the
+            # entry, so :func:`restore_queue_provenance` puts both back when
+            # that proof verifies: a hand-off comes back bound to the
+            # conversation that sent it, and an edited or hand-written stamp
+            # comes back as nothing.
             entry["meta"] = {
                 k: v
                 for k, v in meta.items()
@@ -405,17 +606,28 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
                     QUEUED_CONTAINMENT_META_KEY,
                     TURN_ACTOR_META_KEY,
                     SEND_ORIGIN_META_KEY,
+                    CHANNEL_ORIGIN_META_KEY,
                 )
             }
+        # The proof is the record's own field, never the entry's. It is not
+        # verified here -- verification needs the owner's key, and this reader
+        # is pure -- and it is not carried: :func:`restore_queue_provenance`
+        # reads it off the same line again for the entries admitted here.
+        raw_proof = item.get(ORIGIN_PROOF_KEY)
+        proof = raw_proof if isinstance(raw_proof, str) and raw_proof else None
         try:
-            # Costed against the same key projection the WRITER admits
-            # (:data:`_DURABLE_QUEUE_KEYS`, which has no ``kind``), not against
-            # the entry handed back. Charging the reader for a key the writer
-            # never emitted makes the reader's budget the smaller of the two, and
-            # a queue persisted just under the ceiling would then drop its tail
-            # on the way back in — losing a prompt that WAS durably written,
-            # which is the one outcome this whole value exists to prevent.
-            cost = len(json.dumps({k: v for k, v in entry.items() if k in _DURABLE_QUEUE_KEYS}))
+            # Costed against the same key projection the WRITER emits
+            # (:data:`_DURABLE_QUEUE_KEYS` plus the proof it joins on; no
+            # ``kind``), not against the entry handed back. Charging the reader
+            # for a key the writer never emitted makes the reader's budget the
+            # smaller of the two, and a queue persisted just under the ceiling
+            # would then drop its tail on the way back in — losing a prompt that
+            # WAS durably written, which is the one outcome this whole value
+            # exists to prevent.
+            record = {k: v for k, v in entry.items() if k in _DURABLE_QUEUE_KEYS}
+            if proof is not None:
+                record[ORIGIN_PROOF_KEY] = proof
+            cost = len(json.dumps(record))
         except (TypeError, ValueError):
             # ``meta`` came off an untrusted line: a value json cannot re-emit
             # would also break every later save of this slot.
@@ -433,6 +645,65 @@ def sanitize_restored_queue(raw: object) -> list[dict[str, Any]]:
             len(entries),
         )
     return entries
+
+
+def restore_queue_provenance(owner: Any, entries: list[dict[str, Any]], raw: object) -> None:
+    """The second half of the restore: hand back the provenance the gateway can prove.
+
+    *entries* is what :func:`sanitize_restored_queue` admitted from *raw*, every
+    provenance key stripped. For each, the durable record it came from is read
+    again by id and its :data:`ORIGIN_PROOF_KEY` verified against the entry as
+    restored plus the record's own channel address and admission snapshot, under
+    *owner*'s key. A proof that verifies puts exactly those two mappings back on
+    the entry's ``meta`` and the proof into the owner's sidecar, BEFORE the drain
+    re-validates anything: the entry then drains under the containment it was
+    accepted with, and a channel hand-off is released when its binding is gone
+    and its conversation told, exactly as if the process had never restarted.
+    An entry with no proof, or one that does not verify -- content, address or
+    snapshot rewritten, proof transplanted, another slot -- keeps the stripped
+    reading and fails closed against the constraints that hold now, with the
+    dashboard notice only. The turn actor and the sender stamp are not signed
+    and stay stripped.
+
+    Bounded by the same scan ceiling as the reader. Never raises: a record that
+    cannot be found, read or verified simply proves nothing.
+    """
+    if not entries or not isinstance(raw, list):
+        return
+    from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+    from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
+
+    records: dict[str, dict[str, Any]] = {}
+    for item in raw[:MAX_DURABLE_QUEUE_SCAN]:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        # First record per id: a line carrying two records under one id is
+        # edited, and the proof is over the content, so at most one can verify.
+        if isinstance(item_id, str) and item_id and item_id not in records:
+            records[item_id] = item
+    proofs = _origin_proofs_of(owner)
+    slot_key = str(getattr(owner, "key", "") or "")
+    for entry in entries:
+        record = records.get(entry["id"])
+        if record is None:
+            continue
+        tag = record.get(ORIGIN_PROOF_KEY)
+        address, admission = _provenance_parts(record.get("meta"))
+        if not isinstance(tag, str) or not queue_origin_token.queue_provenance_matches(
+            slot_key, entry["id"], entry.get("content"), address, admission, tag
+        ):
+            continue
+        proofs[entry["id"]] = tag
+        if address is None and admission is None:
+            continue
+        meta = entry.get("meta")
+        if not isinstance(meta, dict):
+            meta = entry["meta"] = {}
+        if admission is not None:
+            meta[QUEUED_CONTAINMENT_META_KEY] = admission
+        if address is not None:
+            meta[CHANNEL_ORIGIN_META_KEY] = address
 
 
 def _delivery_key(content: str) -> str:
@@ -578,6 +849,7 @@ class SlotQueueRepository:
             item["_directive_user_origin"] = True
         if directive_channel_origin:
             item["_directive_channel_origin"] = True
+        _stamp_origin(owner, item, directive_channel_origin=directive_channel_origin)
         owner._queue.append(item)
         owner._note_enqueue()
         return queue_id
@@ -621,6 +893,7 @@ class SlotQueueRepository:
             item["_directive_user_origin"] = True
         if directive_channel_origin:
             item["_directive_channel_origin"] = True
+        _stamp_origin(owner, item, directive_channel_origin=directive_channel_origin)
         owner._queue.insert(index, item)
         owner._note_enqueue()
         return queue_id
@@ -701,6 +974,7 @@ class SlotQueueRepository:
                 item["_directive_channel_origin"] = True
             else:
                 item.pop("_directive_channel_origin", None)
+            _stamp_origin(owner, item, directive_channel_origin=directive_channel_origin)
             return True
         return False
 

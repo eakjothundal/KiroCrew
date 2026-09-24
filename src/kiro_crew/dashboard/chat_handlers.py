@@ -1001,7 +1001,7 @@ async def api_chat(request: web.Request) -> web.StreamResponse:
         _c, _ = redact_exfiltration_urls(message)
         _c, _ = redact_credentials(_c)
         _redacted = _redact_for_display(_c)
-        warn_if_not_durable(slot._queue, qid, slot.key)
+        warn_if_not_durable(slot._queue, qid, slot.key, getattr(slot, "_origin_proofs", None))
         # Start the durable write here too, not only in the busy-slot branch.
         # This branch holds an IDLE slot, so no drain is coming to write the
         # prompt's transcript row and no turn-end flush is scheduled: the queue

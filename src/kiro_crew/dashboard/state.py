@@ -2428,6 +2428,7 @@ class _ChatSlot:
         "_queue_persist_inflight",
         "_queue_persist_owed",
         "_last_enqueue_ts",
+        "_origin_proofs",
         "_approval_futures",
         "_approval_stopped",
         "_trust",
@@ -2780,6 +2781,11 @@ class _ChatSlot:
         # Newest enqueue instant, read only while ``_queue`` is non-empty — see
         # ``_note_enqueue``.
         self._last_enqueue_ts: str = ""
+        # The gateway's dashboard-origin proofs for queued entries, keyed by queue
+        # id -- beside the queue like the enqueue instant, never on an entry (see
+        # ``slot_queue_repository.ORIGIN_PROOF_KEY``). Written by the repository's
+        # stamp, joined onto the durable record, lifted back by the restore.
+        self._origin_proofs: dict[str, str] = {}
         self._approval_futures: dict[str, asyncio.Future[str]] = {}  # type: ignore[type-arg]
         # Approval ids a STOP rejected, rather than a person. A stop resolves the
         # future with an ordinary "rejected", so the runner cannot tell the two
@@ -4233,7 +4239,7 @@ class _ChatSlot:
 
     def durable_queue_entries(self) -> list[dict[str, Any]]:
         """The queued user prompts a metadata writer may persist right now."""
-        return durable_queue_entries(self._queue)
+        return durable_queue_entries(self._queue, self._origin_proofs)
 
     def durable_queue_view(self) -> tuple[list[dict[str, Any]], int]:
         """Persistable queued prompts and the candidate count, from one read.
@@ -4241,7 +4247,7 @@ class _ChatSlot:
         Used where the two are SUBTRACTED (the save's over-cap report), so the
         difference describes one observation of the queue rather than two.
         """
-        return durable_queue_view(self._queue)
+        return durable_queue_view(self._queue, self._origin_proofs)
 
     @property
     def queue_persist_pending(self) -> bool:

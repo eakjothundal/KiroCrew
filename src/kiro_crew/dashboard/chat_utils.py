@@ -470,6 +470,106 @@ def user_text_span(
     return offset, offset + length
 
 
+def dashboard_command_word(message: str, *, channel_origin: bool) -> str:
+    """The leading token the dashboard may read as a COMMAND, or ``""`` for none.
+
+    A turn whose text came from a CHANNEL conversation bound to this session
+    (``channel_busy``'s hand-off, Slack's linked-thread intercept) is prose here:
+    the channel's own command intercept already ran everything that conversation
+    may command, and what it forwarded is what its user meant the model to READ --
+    natively the same text reaches the model as text. Matching it against the
+    dashboard's commands instead would let a channel message run ``/workflow``,
+    ``/goal`` or a harness command on the dashboard owner's authority, which the
+    channel never offered its user. So a channel-origin turn has no command word
+    at all, and every other turn keeps its first token exactly as before.
+    """
+    if channel_origin:
+        return ""
+    return message.split()[0] if message.strip() else ""
+
+
+#: What the person who typed into a linked conversation is told when the leading
+#: token of their message is one the dashboard would have run as a command
+#: (:func:`suppressed_channel_command`). The turn is refused rather than sent as
+#: prose: a ``/compact`` that reaches the model as text is neither the command
+#: they meant nor a message they meant to send, and silence would leave them
+#: waiting for a compaction that never comes.
+CHANNEL_COMMAND_UNAVAILABLE = (
+    "⚠️ `{command}` is not available from a linked conversation, so this message "
+    "was not sent to the agent. Dashboard commands run from the dashboard only."
+)
+
+#: Longest token the refusal repeats back. Under ``claude_code`` any leading slash
+#: is a harness command, so the token is the channel user's own text and may be
+#: arbitrarily long; the notice names it, it does not carry it.
+CHANNEL_COMMAND_TOKEN_MAX = 64
+
+
+def displayable_channel_command(word: str) -> str:
+    """The refused token as the notice, the audit row and the channel may see it.
+
+    The token is untrusted text from a linked conversation, and every surface the
+    refusal reaches -- the persisted transcript row, the SEL ``tool_name``, the
+    Slack post -- is one the intercept already redacts the user's own message for
+    (``redact_exfiltration_urls`` then ``redact_credentials``). The same two
+    redactors run here so the notice cannot hand the raw token back around that
+    redaction, and the result is cut to :data:`CHANNEL_COMMAND_TOKEN_MAX` with an
+    ellipsis: a pasted blob is named by its head, never repeated whole.
+    """
+    text, _ = redact_exfiltration_urls(word)
+    text, _ = redact_credentials(text)
+    if len(text) > CHANNEL_COMMAND_TOKEN_MAX:
+        text = text[: CHANNEL_COMMAND_TOKEN_MAX - 1] + "…"
+    return text
+
+
+def suppressed_channel_command(message: str, *, channel_origin: bool, cc_provider: bool) -> str:
+    """The leading token a channel-origin turn is NOT allowed to run, or ``""``.
+
+    :func:`dashboard_command_word` gives a channel-origin turn no command word, so a
+    leading token the dashboard reads as a command from its own composer -- a
+    member of ``_SLASH_COMMANDS``, any slash under ``claude_code`` -- would
+    otherwise stream to the model as prose with nobody told. That is the wrong
+    outcome for the person who typed it: their channel already answered every
+    command it knows, so a token that reached this far is one the channel forwarded
+    as text and the dashboard would have acted on (Slack's linked-thread intercept
+    delivers ``/compact`` this way). The caller refuses the turn with
+    :data:`CHANNEL_COMMAND_UNAVAILABLE` naming the token. ``""`` for every other
+    turn: composer text keeps its command word, and channel prose -- including a
+    leading token no surface reads as a command -- stays prose.
+
+    A quick-prompt macro (``/plain``, ``/teach``) is NOT in that set. It is a prose
+    shortcut, not a command: ``ContextBuilder.build_message`` expands it for every
+    surface alike, with no command word involved, so ``/plain summarise the log``
+    from a linked thread works exactly as it does from the composer and there is
+    nothing to refuse.
+
+    Under ``claude_code`` the harness owns its command set and the composer forwards
+    ANY leading slash, so that rule alone would refuse a channel message that merely
+    opens with a path (``/usr/bin/python3 --version``). A path is not a command
+    anyone has: a token with a second ``/`` or a ``.`` past its first character
+    (:func:`_path_shaped`) stays prose on every provider.
+    """
+    if not channel_origin or not message.strip():
+        return ""
+    word = message.split()[0]
+    if _path_shaped(word):
+        return ""
+    if is_harness_slash_command(word, cc_provider=cc_provider):
+        return word
+    return ""
+
+
+def _path_shaped(word: str) -> bool:
+    """Whether a leading slash token reads as a filesystem path, not a command.
+
+    A command word is one segment (``/compact``, ``/review``); a path has a second
+    ``/`` (``/usr/bin/python3``) or an extension dot (``/setup.py``) after the first
+    character. No command in ``_SLASH_COMMANDS`` or ``QUICK_PROMPTS`` carries either.
+    """
+    return word.startswith("/") and ("/" in word[1:] or "." in word[1:])
+
+
 def is_harness_slash_command(first_word: str, *, cc_provider: bool) -> bool:
     """Whether *first_word* should be forwarded to the harness as a command.
 

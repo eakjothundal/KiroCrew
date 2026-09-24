@@ -17,6 +17,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from kiro_crew.dashboard.chat import api_chat_slot_queue_edit
 from kiro_crew.dashboard.chat_utils import _edit_queued_by_id
+from kiro_crew.dashboard.queue_origin_token import dashboard_origin_proof
 from kiro_crew.dashboard.state import DashboardState, _ChatSlot
 
 # ── Unit tests: _ChatSlot.queue_edit_by_id ──
@@ -64,6 +65,11 @@ class TestQueueEditHelper:
         slot.queue_edit_by_id(id2, "changed")
         assert slot._queue[0] == {"id": id1, "content": "same", "kind": ""}
         assert slot._queue[1] == {"id": id2, "content": "changed", "kind": ""}
+        # The edit re-signs the words: the proof (beside the queue) is over the content.
+        assert slot._origin_proofs == {
+            id1: dashboard_origin_proof(slot.key, id1, "same"),
+            id2: dashboard_origin_proof(slot.key, id2, "changed"),
+        }
 
     @pytest.mark.parametrize(
         "callback_name",
@@ -278,4 +284,8 @@ class TestQueueEditEndpoint:
             "content": "edited",
             "kind": "",
             "_directive_user_origin": True,
+        }
+        assert slot._origin_proofs == {
+            id1: dashboard_origin_proof(slot.key, id1, "same"),
+            id2: dashboard_origin_proof(slot.key, id2, "edited"),
         }

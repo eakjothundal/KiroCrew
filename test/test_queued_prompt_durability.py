@@ -23,8 +23,10 @@ Pinned here, per layer:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -35,12 +37,17 @@ from kiro_crew.dashboard.chat_persistence import (
     _save_slot_to_history,
     restore_recent_sessions,
 )
+from kiro_crew.dashboard.queue_origin_token import dashboard_origin_proof
+from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
 from kiro_crew.dashboard.slot_queue_repository import (
     EMPTY_QUEUE_SIGNATURE,
     MAX_DURABLE_QUEUE_BYTES,
     MAX_DURABLE_QUEUE_ENTRIES,
     MAX_DURABLE_QUEUE_SCAN,
+    ORIGIN_PROOF_KEY,
+    SlotQueueRepository,
     count_durable_candidates,
+    dashboard_origin_proven,
     durable_queue_entries,
     durable_queue_view,
     queue_persist_signature,
@@ -53,6 +60,7 @@ from kiro_crew.history import (
     SLOT_OWNED_META_KEYS,
     ConversationLog,
 )
+from kiro_crew.messaging.link import ChannelLink
 
 #: The logger the durable-queue warning is emitted on, so a caplog assertion
 #: names the real emitter rather than the root logger.
@@ -1462,20 +1470,347 @@ class TestRestoredEntriesCarryNoHumanAuthority:
 
     def test_a_restored_prompt_reaches_the_drain_as_non_directive(self, tmp_path) -> None:
         # End to end through the real metadata line: the flag is absent from the
-        # written value, and a hand-added one does not survive the read back.
+        # written value, and a hand-added one does not survive the read back. What
+        # IS written beside the words is the gateway's own origin proof -- the one
+        # provenance an editor cannot produce, which is why it may ride along.
         state = _make_state(tmp_path)
         slot = _busy_slot(state)
         slot.queue_append("arm a monitor", directive_user_origin=True)
         _save_slot_to_history(state, slot, closed=False)
 
         persisted = _meta(state)["queued_prompts"]
-        assert persisted == [{"id": persisted[0]["id"], "content": "arm a monitor"}]
+        assert persisted == [
+            {
+                "id": persisted[0]["id"],
+                "content": "arm a monitor",
+                ORIGIN_PROOF_KEY: dashboard_origin_proof(
+                    slot.key, persisted[0]["id"], "arm a monitor"
+                ),
+            }
+        ]
 
         tampered = [{**persisted[0], "_directive_user_origin": True}]
         restored = sanitize_restored_queue(tampered)
         assert restored[0]["content"] == "arm a monitor"
         assert restored[0].get("_directive_user_origin") is None
         assert restored[0].get("_directive_channel_origin") is None
+
+    @pytest.mark.asyncio
+    async def test_a_restored_channel_entry_still_drains_as_channel_text(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The flags never reach disk, so a restored entry drains with none -- and
+        text a CHANNEL handed off would then regain the composer's command word:
+        `/workflow deploy` typed into a linked conversation, queued behind a busy
+        turn, would run on the dashboard owner's authority after a restart. A
+        restored entry has that authority only with the gateway's ADDRESS-LESS
+        proof on it: channel text with no conversation stamped on it (this entry)
+        gets no proof at all, and a placed hand-off's proof is over its address."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state = _make_state(tmp_path)
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        slot = _busy_slot(state)
+        queue_for_next_turn(
+            state, slot, "/workflow deploy", directive_user_origin=True, channel_origin=True
+        )
+        assert slot._queue[0]["id"] not in slot._origin_proofs, "unplaced channel text was stamped"
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert [q["content"] for q in restored._queue] == ["/workflow deploy"]
+        assert restored._queue[0].get("_directive_channel_origin") is None
+        runs: list[dict] = []
+
+        def _run(state_, slot_, message, **kwargs):
+            runs.append({"message": message, **kwargs})
+            return MagicMock()
+
+        monkeypatch.setattr(cr, "_run_chat", _run)
+        monkeypatch.setattr(cr, "spawn_guarded_turn", lambda *a, **kw: MagicMock())
+
+        assert await cr._start_next_queued_turn(state, restored) is True
+
+        assert runs and runs[0]["message"] == "/workflow deploy"
+        assert runs[0]["_turn_provenance_restored"] is True
+        assert (
+            runs[0]["_directive_channel_origin"] is True
+        ), "a restored channel entry regained the composer's command word"
+        assert runs[0]["_directive_user_origin"] is False
+
+    @pytest.mark.asyncio
+    async def test_an_editor_cannot_give_a_persisted_channel_command_the_composers_authority(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The persisted line is an ordinary writable file. Whatever an editor
+        removes from or adds to a channel hand-off's entry -- every provenance key
+        stripped, the meta emptied -- the entry comes back WITHOUT the composer's
+        command word: authority after a restart is granted only by a proof the
+        gateway stamped and can verify, never by the absence of a marker."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state = _make_state(tmp_path)
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        slot = _busy_slot(state)
+        queue_for_next_turn(
+            state, slot, "/workflow deploy", directive_user_origin=True, channel_origin=True
+        )
+        _save_slot_to_history(state, slot, closed=False)
+        # The editor: keep the words, drop every stamp the line carries.
+        persisted = _meta(state)["queued_prompts"]
+        edited = [{"id": persisted[0]["id"], "content": persisted[0]["content"], "meta": {}}]
+        state.conversation_log.update_metadata("dashboard:s1", {"queued_prompts": edited})
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert [q["content"] for q in restored._queue] == ["/workflow deploy"]
+        runs: list[dict] = []
+
+        def _run(state_, slot_, message, **kwargs):
+            runs.append({"message": message, **kwargs})
+            return MagicMock()
+
+        monkeypatch.setattr(cr, "_run_chat", _run)
+        monkeypatch.setattr(cr, "spawn_guarded_turn", lambda *a, **kw: MagicMock())
+
+        assert await cr._start_next_queued_turn(state, restored) is True
+
+        assert runs and runs[0]["message"] == "/workflow deploy"
+        assert (
+            runs[0]["_directive_channel_origin"] is True
+        ), "an edited persisted channel command ran with the composer's authority after a restart"
+
+    @pytest.mark.asyncio
+    async def test_a_dashboard_entry_keeps_its_command_word_through_a_restart(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The other half of default-deny: a composer-queued command is written with
+        the gateway's proof, the proof survives the round trip, and the restored
+        entry drains with the composer's command word it was accepted with."""
+        from unittest.mock import MagicMock
+
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.chat_delivery import queue_for_next_turn
+
+        state = _make_state(tmp_path)
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        slot = _busy_slot(state)
+        queue_for_next_turn(state, slot, "/workflow deploy", directive_user_origin=True)
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert dashboard_origin_proven(restored, restored._queue[0])
+        runs: list[dict] = []
+
+        def _run(state_, slot_, message, **kwargs):
+            runs.append({"message": message, **kwargs})
+            return MagicMock()
+
+        monkeypatch.setattr(cr, "_run_chat", _run)
+        monkeypatch.setattr(cr, "spawn_guarded_turn", lambda *a, **kw: MagicMock())
+
+        assert await cr._start_next_queued_turn(state, restored) is True
+
+        assert runs and runs[0]["message"] == "/workflow deploy"
+        assert runs[0]["_turn_provenance_restored"] is True
+        assert (
+            runs[0]["_directive_channel_origin"] is False
+        ), "a proven dashboard entry lost its command word across the restart"
+
+
+class TestTheOriginProof:
+    """The gateway's provenance proof grants nothing an editor can produce.
+
+    It is an HMAC over the slot key, the queue id, the content, the entry's channel
+    address (none for dashboard text) and its admission snapshot, under a key
+    derived from the fenced signing secret, so every way of rewriting the persisted
+    line -- new words, a new address or snapshot, a proof moved between entries or
+    slots, a hand-written tag -- verifies as nothing. It lives BESIDE the queue
+    (``_origin_proofs``, keyed by id), never on the entry. An address-less proof is
+    the DASHBOARD proof, the one that grants the composer's command word; a placed
+    hand-off's proof is over its address and never verifies as that.
+    """
+
+    def _slot(self, key: str = "s1"):
+        return SimpleNamespace(
+            key=key, _queue=[], _last_enqueue_ts=None, _note_enqueue=lambda: None
+        )
+
+    def test_a_dashboard_entry_is_stamped_and_unplaced_channel_text_is_not(self) -> None:
+        repo = SlotQueueRepository()
+        slot = self._slot()
+        repo.queue_append(slot, "arm a monitor", directive_user_origin=True)
+        repo.queue_append(slot, "/workflow deploy", directive_channel_origin=True)
+        dashboard, channel = slot._queue
+        assert dashboard_origin_proven(slot, dashboard)
+        # Channel text with no conversation stamped on it: the proof of a hand-off
+        # is the proof of its address, so this one gets none and restores as prose.
+        assert channel["id"] not in slot._origin_proofs
+        assert not dashboard_origin_proven(slot, channel)
+        # Neither entry carries the proof itself: the entry is exactly what was enqueued
+        # (the process-local directive flag included), with no ``meta`` created for it.
+        assert dashboard == {
+            "id": dashboard["id"],
+            "content": "arm a monitor",
+            "kind": "",
+            "_directive_user_origin": True,
+        }
+
+    def test_a_placed_hand_off_is_stamped_with_a_channel_proof(self) -> None:
+        from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+        from kiro_crew.dashboard.queue_origin_token import queue_provenance_proof
+
+        repo = SlotQueueRepository()
+        slot = self._slot()
+        address = {"channel_type": "discord", "channel_id": "c1", "thread_id": None}
+        admitted = {"linked": False, "mirrored": True, "mirror_identity": "discord:c1:"}
+        meta = {CHANNEL_ORIGIN_META_KEY: address, QUEUED_CONTAINMENT_META_KEY: admitted}
+        qid = repo.queue_append(
+            slot,
+            "/workflow deploy",
+            meta=meta,
+            directive_user_origin=True,
+            directive_channel_origin=True,
+        )
+        assert slot._origin_proofs == {
+            qid: queue_provenance_proof(
+                "s1", qid, "/workflow deploy", channel_address=address, admission=admitted
+            )
+        }
+        # A channel proof is not a dashboard proof: no composer command word.
+        assert not dashboard_origin_proven(slot, slot._queue[0])
+        # And the proof is over the stamps: either rewritten fails it.
+        assert (
+            queue_provenance_proof(
+                "s1", qid, "/workflow deploy", channel_address=None, admission=admitted
+            )
+            != slot._origin_proofs[qid]
+        )
+        assert (
+            queue_provenance_proof(
+                "s1",
+                qid,
+                "/workflow deploy",
+                channel_address=address,
+                admission={**admitted, "app": True},
+            )
+            != slot._origin_proofs[qid]
+        )
+
+    def test_rewritten_words_outlive_their_proof(self) -> None:
+        repo = SlotQueueRepository()
+        slot = self._slot()
+        repo.queue_append(slot, "summarise this", directive_user_origin=True)
+        entry = dict(slot._queue[0], content="/workflow deploy")
+        assert not dashboard_origin_proven(slot, entry)
+
+    def test_a_proof_does_not_move_between_entries_or_slots(self) -> None:
+        repo = SlotQueueRepository()
+        slot = self._slot()
+        repo.queue_append(slot, "/workflow deploy", directive_user_origin=True)
+        repo.queue_append(slot, "/workflow deploy", directive_channel_origin=True)
+        proven, channel = slot._queue
+        proof = slot._origin_proofs[proven["id"]]
+        slot._origin_proofs[channel["id"]] = proof
+        assert not dashboard_origin_proven(slot, channel), "a proof moved between entries verified"
+        other = self._slot("s2")
+        other._origin_proofs = {proven["id"]: proof}
+        assert not dashboard_origin_proven(other, proven), "a proof verified against another slot"
+        slot._origin_proofs[proven["id"]] = "deadbeef"
+        assert not dashboard_origin_proven(slot, proven)
+        slot._origin_proofs[proven["id"]] = 1
+        assert not dashboard_origin_proven(slot, proven)
+        del slot._origin_proofs[proven["id"]]
+        assert not dashboard_origin_proven(slot, proven)
+        assert not dashboard_origin_proven(SimpleNamespace(key="s1"), proven), "no sidecar at all"
+
+    def test_an_edit_re_signs_the_words_and_an_unplaced_channel_edit_drops_the_proof(
+        self,
+    ) -> None:
+        repo = SlotQueueRepository()
+        slot = self._slot()
+        qid = repo.queue_append(slot, "summarise this", directive_user_origin=True)
+        assert repo.queue_edit_by_id(slot, qid, "/workflow deploy", directive_user_origin=True)
+        assert dashboard_origin_proven(
+            slot, slot._queue[0]
+        ), "the edited words carry no valid proof"
+        # Channel text with no conversation on the entry: no proof (see above).
+        assert repo.queue_edit_by_id(slot, qid, "/workflow deploy", directive_channel_origin=True)
+        assert qid not in slot._origin_proofs
+
+    def test_a_system_entry_keeps_its_shape_and_gets_no_proof(self) -> None:
+        repo = SlotQueueRepository()
+        slot = self._slot()
+        repo.queue_append(slot, "[cron] nightly", kind="cron_notification")
+        assert "meta" not in slot._queue[0]
+        assert slot._origin_proofs == {}
+
+    def test_a_consumed_entry_leaves_no_proof_behind(self) -> None:
+        repo = SlotQueueRepository()
+        slot = self._slot()
+        first = repo.queue_append(slot, "one", directive_user_origin=True)
+        repo.queue_pop(slot, 0)
+        second = repo.queue_append(slot, "two", directive_user_origin=True)
+        assert set(slot._origin_proofs) == {second}, first
+
+    def test_the_proof_is_beside_the_queue_and_rides_the_record_not_the_entry(
+        self, tmp_path
+    ) -> None:
+        """Red-first on the r5 head (the proof sat in the entry's ``meta``): the live
+        entry and every board-facing projection carry no proof, the durable record
+        carries it as its own field, and the restore path hands it back to the slot's
+        sidecar so the restored entry verifies while still carrying no proof."""
+        state = _make_state(tmp_path)
+        slot = _busy_slot(state)
+        meta = {"sendId": "send-1"}
+        qid = slot.queue_append("/workflow deploy", meta=meta, directive_user_origin=True)
+        # The entry is what was enqueued, the caller's own meta object included.
+        assert slot._queue == [
+            {
+                "id": qid,
+                "content": "/workflow deploy",
+                "kind": "",
+                "meta": {"sendId": "send-1"},
+                "_directive_user_origin": True,
+            }
+        ]
+        assert slot._queue[0]["meta"] is meta
+        assert ORIGIN_PROOF_KEY not in json.dumps(slot.to_dict())
+        # The durable record joins the proof on, beside id, content and meta.
+        record = slot.durable_queue_entries()
+        assert record == [
+            {
+                "id": qid,
+                "content": "/workflow deploy",
+                "meta": {"sendId": "send-1"},
+                ORIGIN_PROOF_KEY: dashboard_origin_proof(slot.key, qid, "/workflow deploy"),
+            }
+        ]
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert restored._queue[0]["meta"] == {"sendId": "send-1"}
+        assert ORIGIN_PROOF_KEY not in restored._queue[0]
+        assert ORIGIN_PROOF_KEY not in json.dumps(restored.to_dict())
+        assert restored._origin_proofs == {qid: record[0][ORIGIN_PROOF_KEY]}
+        assert dashboard_origin_proven(restored, restored._queue[0])
+        # A reader handed no sidecar restores the entry unproven -- the fail-closed reading.
+        bare = sanitize_restored_queue(_meta(state)["queued_prompts"])
+        assert bare[0]["content"] == "/workflow deploy" and ORIGIN_PROOF_KEY not in bare[0]
+        assert not dashboard_origin_proven(SimpleNamespace(key="s1"), bare[0])
 
 
 class TestTheTwoByteBudgetsAgree:
@@ -1544,7 +1879,7 @@ class TestTheHoldBranchStartsTheWrite:
         # The branch is inside the send handler behind a sub-agent probe; pin the
         # call at the source so the receipt and the write cannot drift apart.
         src = inspect.getsource(chat_handlers)
-        hold = src.split("warn_if_not_durable(slot._queue, qid, slot.key)", 1)[1]
+        hold = src.split("warn_if_not_durable(slot._queue, qid, slot.key, ", 1)[1]
         hold = hold.split("return web.json_response(", 1)[0]
         assert "start_queue_persist(state, slot)" in hold
 
@@ -1558,14 +1893,17 @@ class TestTheHoldBranchStartsTheWrite:
 
 
 class TestRestoredEntriesCarryNoAdmissionSnapshot:
-    """A restored entry is re-checked against the constraints that hold NOW.
+    """The pure reader re-checks a restored entry against the constraints that hold NOW.
 
     The drain's re-check treats a constraint the entry recorded as already-held
     at admission as "not a change", so the two failure directions are opposite:
     an ABSENT snapshot is checked against every currently-held constraint and
     fails closed, while a FORGED all-True one reports nothing newly held and
     fails open. A hand-written entry would then drain into a linked or mirrored
-    slot and republish to an audience its admission never contemplated.
+    slot and republish to an audience its admission never contemplated. So
+    ``sanitize_restored_queue`` strips the key, and only the second step
+    (``restore_queue_provenance``) puts back a snapshot the gateway's own proof
+    verifies -- the round-trip test below is the boundary between the two.
     """
 
     def test_the_containment_snapshot_is_stripped_on_restore(self) -> None:
@@ -1610,6 +1948,11 @@ class TestRestoredEntriesCarryNoAdmissionSnapshot:
         assert restored[0]["meta"] == {"sendId": "s-1", "attachments": ["a.png"]}
 
     def test_a_forged_snapshot_does_not_survive_the_real_round_trip(self, tmp_path) -> None:
+        """Red-first on the r6 head, in the other direction: there the gateway's OWN
+        snapshot was stripped too, and a restart inside a turn on a mirrored slot
+        dropped every queued prompt at the first drain. The snapshot the gateway
+        recorded at admission rides its proof and comes back; the one an editor
+        writes over it does not."""
         from kiro_crew.dashboard.session_control import QUEUED_CONTAINMENT_META_KEY
 
         state = _make_state(tmp_path)
@@ -1619,10 +1962,34 @@ class TestRestoredEntriesCarryNoAdmissionSnapshot:
         del state._slots["s1"]
 
         restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert restored._queue[0]["content"] == "hi"
+        assert restored._queue[0]["meta"] == {QUEUED_CONTAINMENT_META_KEY: {"linked": True}}
 
+        # The editor: the same record with the snapshot widened to every constraint.
+        persisted = _meta(state)["queued_prompts"]
+        forged = [
+            {
+                **persisted[0],
+                "meta": {
+                    QUEUED_CONTAINMENT_META_KEY: {
+                        "linked": True,
+                        "mirrored": True,
+                        "app": True,
+                        "unattended": True,
+                        "ephemeral": True,
+                    }
+                },
+            }
+        ]
+        state.conversation_log.update_metadata("dashboard:s1", {"queued_prompts": forged})
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
         assert restored is not None
         assert restored._queue[0]["content"] == "hi"
         assert QUEUED_CONTAINMENT_META_KEY not in restored._queue[0].get("meta", {})
+        assert restored._origin_proofs == {}
 
     def test_the_drain_recheck_reports_a_held_constraint_after_restore(self) -> None:
         # The point of stripping: the re-check must SEE the constraint as newly
@@ -1731,6 +2098,287 @@ class TestRestoredEntriesCarryNoSenderStamp:
 
         assert send_origin_slot(stamp) == "sender-slot"
         assert send_origin_tab(stamp) == sender._tab_id
+
+
+class TestARestoredHandOffKeepsItsBindingUnderTheGatewaysProof:
+    """A channel hand-off comes back from a restart exactly as it was queued -- or not at all.
+
+    Red-first on the r6 head, where this was the fenced GPT block: the restore
+    stripped the hand-off's admission snapshot and channel stamp, the drain then
+    read the slot's existing mirror as NEWLY added and deleted the prompt, and the
+    channel notice was gated on the stamp the restore had removed -- so one gateway
+    restart inside one dashboard turn on a bound session lost the sender's message
+    with the sender told nothing. Now the gateway's proof covers the address and
+    the snapshot, ``restore_queue_provenance`` puts both back BEFORE the drain
+    re-validates, and the three outcomes the design promises hold across the
+    restart: an unchanged binding drains, a changed binding drops WITH the notice
+    to the conversation, and a stamp the gateway never signed -- an editor's --
+    is stripped and reaches no send.
+    """
+
+    _ORIGIN = ChannelLink("discord", channel_id="c1")
+    _VICTIM = {"channel_type": "discord", "channel_id": "victim-c1", "thread_id": None}
+
+    def _mirror(self, state, link) -> None:
+        # The binding, from the slot's side: the conversation resumes the session
+        # through an inbound-capable mirror link the session store answers with.
+        state.sessions.get_mirror_link = MagicMock(return_value=link)
+
+    async def _restart_with_a_hand_off_queued(self, state, text: str = "and the weather?"):
+        """Queue a hand-off behind a running dashboard turn on a mirrored slot, then
+        lose the process: save, drop the slot, rehydrate from the line."""
+        from kiro_crew.dashboard.channel_busy import HANDOFF_QUEUED, hand_to_dashboard_turn
+
+        self._mirror(state, self._ORIGIN)
+        slot = _busy_slot(state)
+        pending = asyncio.get_running_loop().create_future()
+        slot.task = pending
+        try:
+            outcome = hand_to_dashboard_turn(
+                state, "dashboard:s1", text, origin=self._ORIGIN, principal="u1"
+            )
+        finally:
+            pending.cancel()
+        assert outcome == HANDOFF_QUEUED
+        qid = slot._queue[0]["id"]
+        admitted = slot._queue[0]["meta"][QUEUED_CONTAINMENT_META_KEY]
+        assert admitted["mirrored"] is True and admitted["mirror_identity"] == "discord:c1:"
+        _save_slot_to_history(state, slot, closed=False)
+        del state._slots["s1"]
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        return restored, qid, admitted
+
+    def _watch_the_notice(self, monkeypatch) -> list[tuple[str, dict, str, str]]:
+        from kiro_crew.dashboard import channel_busy
+
+        told: list[tuple[str, dict, str, str]] = []
+
+        async def _notify(
+            st, session_key: str, origin, *, reason: str, principal: str = ""
+        ) -> bool:
+            told.append((session_key, origin.to_dict(), reason, principal))
+            return True
+
+        monkeypatch.setattr(channel_busy, "notify_channel_origin_dropped", _notify)
+        return told
+
+    @pytest.mark.asyncio
+    async def test_the_hand_off_comes_back_as_it_was_queued(self, tmp_path) -> None:
+        from kiro_crew.dashboard.channel_busy import (
+            CHANNEL_ORIGIN_META_KEY,
+            channel_origin_address,
+            channel_origin_principal,
+        )
+
+        state = _make_state(tmp_path)
+        restored, qid, admitted = await self._restart_with_a_hand_off_queued(state)
+
+        (entry,) = restored._queue
+        assert entry["content"] == "and the weather?"
+        # Both signed parts are back on the entry, byte-for-byte what was admitted.
+        assert entry["meta"][QUEUED_CONTAINMENT_META_KEY] == admitted
+        assert entry["meta"][CHANNEL_ORIGIN_META_KEY] == {
+            "channel_type": "discord",
+            "channel_id": "c1",
+            "thread_id": None,
+            "principal": "u1",
+        }
+        link = channel_origin_address(entry["meta"])
+        assert link is not None and (link.channel_type, link.channel_id) == ("discord", "c1")
+        assert channel_origin_principal(entry["meta"]) == "u1"
+        # The proof rides the record and is back in the sidecar, never on the entry
+        # or the board; and it is a CHANNEL proof, so no composer command word.
+        assert restored._origin_proofs == {qid: _meta(state)["queued_prompts"][0][ORIGIN_PROOF_KEY]}
+        assert ORIGIN_PROOF_KEY not in entry
+        assert ORIGIN_PROOF_KEY not in json.dumps(restored.to_dict())
+        assert not dashboard_origin_proven(restored, entry)
+        # The flags still never round-trip: the drain derives channel authority
+        # from the proof, not from a marker on the line.
+        assert entry.get("_directive_channel_origin") is None
+        assert entry.get("_directive_user_origin") is None
+
+    @pytest.mark.asyncio
+    async def test_an_unchanged_binding_drains_and_runs_after_the_restart(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """(a) Restart inside a dashboard turn with a bound hand-off queued: after
+        the restore the prompt drains and runs, as channel text, in the session the
+        conversation is still bound to. On the r6 head the drain deleted it here."""
+        from kiro_crew.dashboard import chat_runner as cr
+
+        state = _make_state(tmp_path)
+        restored, _qid, _admitted = await self._restart_with_a_hand_off_queued(state)
+        told = self._watch_the_notice(monkeypatch)
+
+        cr._drop_stale_admissions(state, restored)
+        await asyncio.sleep(0)
+
+        assert [q["content"] for q in restored._queue] == ["and the weather?"]
+        assert told == []
+        assert not any(
+            "Queued message dropped" in (m.get("content") or "")
+            for m in restored.messages
+            if isinstance(m, dict)
+        )
+        runs: list[dict] = []
+
+        def _run(state_, slot_, message, **kwargs):
+            runs.append({"message": message, **kwargs})
+            return MagicMock()
+
+        monkeypatch.setattr(cr, "_run_chat", _run)
+        monkeypatch.setattr(cr, "spawn_guarded_turn", lambda *a, **kw: MagicMock())
+
+        assert await cr._start_next_queued_turn(state, restored) is True
+
+        assert runs and runs[0]["message"] == "and the weather?"
+        assert runs[0]["_turn_provenance_restored"] is True
+        assert runs[0]["_directive_channel_origin"] is True
+        assert runs[0]["_directive_user_origin"] is False
+        assert restored._queue == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("binding_now", "phrase"),
+        [
+            pytest.param(None, "left the session", id="released"),
+            pytest.param(ChannelLink("discord", channel_id="c2"), "retargeted", id="retargeted"),
+        ],
+    )
+    async def test_a_changed_binding_drops_and_tells_the_conversation(
+        self, tmp_path, monkeypatch, binding_now, phrase
+    ) -> None:
+        """(b) The binding changed across the restart -- the conversation left the
+        session, or the mirror moved to another one -- so the entry is dropped, and
+        the conversation that sent it is told, at the address the restore proved and
+        with the principal the dispatcher admitted."""
+        from kiro_crew.dashboard import chat_runner as cr
+
+        state = _make_state(tmp_path)
+        restored, _qid, _admitted = await self._restart_with_a_hand_off_queued(state)
+        self._mirror(state, binding_now)
+        told = self._watch_the_notice(monkeypatch)
+
+        cr._drop_stale_admissions(state, restored)
+        await asyncio.sleep(0)  # the notice is fire-and-forget
+
+        assert restored._queue == []
+        assert len(told) == 1, told
+        session_key, address, reason, principal = told[0]
+        assert session_key == "dashboard:s1"
+        assert (address["channel_type"], address["channel_id"]) == ("discord", "c1")
+        assert phrase in reason
+        assert principal == "u1"
+        # The slot keeps its own notice too: both records exist.
+        assert any(
+            "Queued message dropped" in (m.get("content") or "")
+            for m in restored.messages
+            if isinstance(m, dict)
+        )
+
+    def test_an_editors_stamp_is_stripped_and_resolves_to_no_address(self) -> None:
+        # The pure reader alone: a stamp on the line proves nothing.
+        from kiro_crew.dashboard.channel_busy import (
+            CHANNEL_ORIGIN_META_KEY,
+            channel_binding_released,
+            channel_origin_address,
+        )
+
+        restored = sanitize_restored_queue(
+            [
+                {
+                    "id": "q1",
+                    "content": "hi",
+                    "meta": {CHANNEL_ORIGIN_META_KEY: dict(self._VICTIM), "sendId": "s-1"},
+                }
+            ]
+        )
+        assert restored[0]["meta"] == {"sendId": "s-1"}
+        assert channel_origin_address(restored[0].get("meta")) is None
+        # And without the stamp the entry is not a channel hand-off: an unmirrored
+        # slot does not release it.
+        assert channel_binding_released({"mirrored": False}, restored[0].get("meta")) is False
+
+    @pytest.mark.asyncio
+    async def test_a_stamp_the_gateway_never_signed_reaches_no_send_at_the_drain(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The editor adds a conversation to a composer prompt's record. Restored, the
+        stamp is gone: rejected at the drain (the slot is linked and the unproven
+        entry fails closed), the entry tells the conversation the editor named
+        nothing -- the dashboard notice only, as before the proof existed."""
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+
+        state = _make_state(tmp_path)
+        state.sessions.get_mirror_link = MagicMock(return_value=None)
+        slot = _busy_slot(state)
+        slot.queue_append("hi", directive_user_origin=True)
+        _save_slot_to_history(state, slot, closed=False)
+        persisted = _meta(state)["queued_prompts"]
+        edited = [{**persisted[0], "meta": {CHANNEL_ORIGIN_META_KEY: dict(self._VICTIM)}}]
+        state.conversation_log.update_metadata("dashboard:s1", {"queued_prompts": edited})
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        assert [q["content"] for q in restored._queue] == ["hi"]
+        assert CHANNEL_ORIGIN_META_KEY not in restored._queue[0].get("meta", {})
+        assert restored._origin_proofs == {}, "an edited record kept its proof"
+        restored.linked_session_key = "discord:elsewhere:gen0"
+        told = self._watch_the_notice(monkeypatch)
+
+        cr._drop_stale_admissions(state, restored)
+        await asyncio.sleep(0)
+
+        assert restored._queue == [], "the unproven restored entry should have been rejected"
+        assert told == [], "a stamp the gateway never signed reached a send"
+        assert any(
+            "Queued message dropped" in (m.get("content") or "")
+            for m in restored.messages
+            if isinstance(m, dict)
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("edit", ["address", "snapshot"])
+    async def test_a_rewritten_address_or_snapshot_outlives_the_proof(
+        self, tmp_path, monkeypatch, edit
+    ) -> None:
+        """A real hand-off's record, edited: the address pointed at another
+        conversation, or the snapshot widened. Either edit fails the proof, so BOTH
+        parts are stripped, the entry fails closed against the slot's live mirror,
+        and neither the victim nor the original conversation is sent anything."""
+        from kiro_crew.dashboard import chat_runner as cr
+        from kiro_crew.dashboard.channel_busy import CHANNEL_ORIGIN_META_KEY
+
+        state = _make_state(tmp_path)
+        restored, _qid, _admitted = await self._restart_with_a_hand_off_queued(state)
+        persisted = _meta(state)["queued_prompts"]
+        meta = dict(persisted[0]["meta"])
+        if edit == "address":
+            meta[CHANNEL_ORIGIN_META_KEY] = dict(self._VICTIM)
+        else:
+            meta[QUEUED_CONTAINMENT_META_KEY] = {**meta[QUEUED_CONTAINMENT_META_KEY], "app": True}
+        state.conversation_log.update_metadata(
+            "dashboard:s1", {"queued_prompts": [{**persisted[0], "meta": meta}]}
+        )
+        del state._slots["s1"]
+
+        restored = _rehydrate_slot_from_history(state, "s1")
+        assert restored is not None
+        (entry,) = restored._queue
+        assert CHANNEL_ORIGIN_META_KEY not in entry["meta"]
+        assert QUEUED_CONTAINMENT_META_KEY not in entry["meta"]
+        assert restored._origin_proofs == {}
+        told = self._watch_the_notice(monkeypatch)
+
+        cr._drop_stale_admissions(state, restored)
+        await asyncio.sleep(0)
+
+        # The slot is still mirrored, which the stripped entry never recorded.
+        assert restored._queue == []
+        assert told == []
 
 
 class TestAStaleQueueSnapshotIsNotCommitted:

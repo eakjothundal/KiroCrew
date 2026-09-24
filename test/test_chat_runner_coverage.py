@@ -3496,6 +3496,265 @@ class TestRunChatLocalCommands:
         state.sessions.get_or_create.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_channel_origin_command_is_refused_with_a_notice(self, tmp_path):
+        """A ``/compact`` typed into a linked conversation (Slack's linked thread, a
+        channel hand-off) has no command word on the dashboard. That must not make
+        it silent prose: the person who typed it is told, and the text is not sent."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with _quiet_sel():
+            await chat_runner._run_chat(
+                state, slot, "/compact", _directive_user_origin=True, _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_not_awaited()
+        notices = [
+            m.get("content", "")
+            for m in slot.messages
+            if "not available from a linked conversation" in m.get("content", "")
+        ]
+        assert notices, "a channel-origin /compact was forwarded silently"
+        assert "`/compact`" in notices[0]
+        assert slot.messages[-1]["role"] == "done"
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_quick_prompt_is_routed_as_prose(self, tmp_path):
+        """``/plain summarise the log`` typed into a linked thread is a prose
+        shortcut, not a command: ``/plain`` is in no command set on any provider and
+        ``ContextBuilder.build_message`` expands it surface-neutrally. It is not
+        refused with ``CHANNEL_COMMAND_UNAVAILABLE``; the turn runs and the model
+        gets the expanded quick prompt with the user's own words, exactly as it would
+        from the composer."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        _set_stream(client, [LLMEvent(kind=EVENT_TEXT_CHUNK, text="ok"), _complete()])
+
+        with _quiet_sel():
+            await chat_runner._run_chat(
+                state,
+                slot,
+                "/plain summarise the log",
+                _directive_user_origin=True,
+                _directive_channel_origin=True,
+            )
+        await _settle(slot)
+
+        assert not any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "a quick-prompt shortcut from a linked thread was refused as a command"
+        state.sessions.get_or_create.assert_awaited()
+        # The runner forwards the text untouched; expanding the macro is
+        # ``ContextBuilder.build_message``'s job (not wired in this fixture) and it
+        # does so for every surface alike.
+        prompt = client.stream.call_args_list[0].args[0]
+        assert "/plain summarise the log" in prompt
+
+    @pytest.mark.asyncio
+    async def test_a_credential_shaped_channel_token_is_redacted_in_the_notice(self, tmp_path):
+        """Under ``claude_code`` ANY leading slash is a harness command, so the refused
+        token is the channel user's own text. The intercept already redacts the
+        transcript copy of their message; the notice that names the token -- a
+        persisted transcript row, a SEL ``tool_name`` and a Slack post -- must not
+        hand the raw token back around that redaction, and a token is bounded so a
+        pasted blob cannot ride the notice whole."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        secret = "ghp_" + "A" * 36
+        token = "/" + secret + "x" * 200
+        logged: list[dict] = []
+
+        with (
+            patch.object(chat_runner, "is_claude_code", return_value=True),
+            patch.object(chat_runner, "sel") as sel_fn,
+        ):
+            sel_fn.return_value.log_tool_invocation = lambda **kw: logged.append(kw)
+            await chat_runner._run_chat(
+                state, slot, token + " please", _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_not_awaited()
+        notices = [
+            m.get("content", "")
+            for m in slot.messages
+            if "not available from a linked conversation" in m.get("content", "")
+        ]
+        assert notices, "a channel-origin harness token was forwarded silently"
+        assert secret not in notices[0], "the raw credential reached the transcript notice"
+        assert "[REDACTED" in notices[0]
+        assert len(notices[0]) < 200, "an unbounded token rode the notice whole"
+        blocked = [kw for kw in logged if kw.get("outcome") == "blocked"]
+        assert blocked and secret not in blocked[0]["tool_name"]
+        from kiro_crew.dashboard.chat_utils import CHANNEL_COMMAND_TOKEN_MAX
+
+        assert len(blocked[0]["tool_name"]) <= CHANNEL_COMMAND_TOKEN_MAX
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_refusal_reaches_the_linked_conversation(self, tmp_path):
+        """The person who typed the command reads their channel, not this
+        transcript, so the notice takes the same two legs a turn's reply takes."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()) as slack,
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as mirror,
+        ):
+            await chat_runner._run_chat(state, slot, "/compact", _directive_channel_origin=True)
+        await _settle(slot)
+
+        slack.assert_awaited_once()
+        assert "`/compact` is not available from a linked conversation" in slack.await_args.args[-1]
+        mirror.assert_awaited_once()
+        assert (
+            "`/compact` is not available from a linked conversation" in mirror.await_args.args[-1]
+        )
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_refusal_is_not_posted_into_a_governance_denied_slack_thread(
+        self, tmp_path
+    ):
+        """The Slack leg is a proactive send to a channel, so it asks the channels-scope
+        governance gate first (``channel_egress_permitted``), as the ladder leg and the
+        drop notice's Slack leg do. A command queued while the scope was permitted and
+        drained after an administrator denied it must not reach the thread. The
+        transcript keeps the notice."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "channel_egress_permitted", return_value=False) as gate,
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()) as slack,
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+        ):
+            await chat_runner._run_chat(state, slot, "/compact", _directive_channel_origin=True)
+        await _settle(slot)
+
+        assert gate.call_args_list, "the Slack leg never asked the governance gate"
+        assert gate.call_args.args[1] == "slack" and isinstance(gate.call_args.args[0], str)
+        slack.assert_not_awaited()  # the refusal notice must not reach a governance-denied thread
+        assert any(
+            "`/compact` is not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_refusal_is_withheld_from_a_fenced_session(self, tmp_path):
+        """The notice is a cross-surface publication like the turn's reply, so it asks
+        the same fence: a peer steer was admitted under one containment and the
+        containment holding NOW is another, so nothing may publish to the audience the
+        admission never saw. The transcript keeps the notice either way."""
+        from kiro_crew.dashboard import session_control as sc
+        from kiro_crew.messaging.link import ChannelLink
+
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        # Admitted with no mirror, then a mirror appears: `mirrored` newly holds.
+        slot._steer_audience_fences["tok"] = sc.containment_meta(state, slot)
+        state.sessions.get_mirror_link = MagicMock(
+            return_value=ChannelLink("telegram", channel_id="7")
+        )
+        assert chat_runner.cross_surface_withheld(state, slot) is True
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()) as mirror,
+        ):
+            await chat_runner._run_chat(state, slot, "/compact", _directive_channel_origin=True)
+        await _settle(slot)
+
+        mirror.assert_not_awaited()
+        assert any(
+            "`/compact` is not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "the transcript must still carry the notice; only the publication is withheld"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_channel_command_hands_the_queue_forward(self, tmp_path):
+        """A channel hand-off is QUEUED by design, so the refusal is reached from the
+        drain with more entries possibly behind it. Returning before the turn's tail
+        would strand them until some unrelated message drains the slot -- and a later
+        message could run first. The refusal leaves through the same queue-cycle
+        hand-off the tail uses: the next entry starts, or the cycle finishes."""
+        state, client = _runner_state(tmp_path)
+        slot = _slot()
+        slot._empty_response_retries = 2
+        slot.queue_append(
+            "and the weather?", directive_user_origin=True, directive_channel_origin=True
+        )
+        real_run = chat_runner._run_chat
+
+        with (
+            _quiet_sel(),
+            patch.object(chat_runner, "_deliver_linked_slack_message", new=AsyncMock()),
+            patch.object(chat_runner, "_deliver_cross_surface_reply", new=AsyncMock()),
+            patch.object(chat_runner, "spawn_guarded_turn", return_value=MagicMock()) as spawn,
+            patch.object(chat_runner, "_run_chat", return_value=MagicMock()),
+        ):
+            await real_run(
+                state, slot, "/compact", _directive_user_origin=True, _directive_channel_origin=True
+            )
+
+        assert slot._queue == [], "the follow-up stayed stranded behind the refused command"
+        assert spawn.call_count == 1, "the next queued turn was not started"
+
+    @pytest.mark.asyncio
+    async def test_channel_origin_prose_still_reaches_the_provider(self, tmp_path):
+        """Only a token the dashboard would have run is refused; channel prose --
+        including a leading slash no surface reads as a command -- runs as text."""
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with _quiet_sel():
+            await chat_runner._run_chat(
+                state, slot, "/usr/bin/python3 fails to start", _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_awaited()
+        assert not any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_path_shaped_channel_token_is_prose_under_claude_code_too(self, tmp_path):
+        """Under ``claude_code`` every leading slash is a harness command from the
+        composer -- but a path is not a command anyone typed: a second ``/`` or a
+        ``.`` after the first segment is a file, and a channel message opening with
+        one is delivered, not refused."""
+        state, client = _runner_state(tmp_path)
+        _set_stream(client, [_complete()])
+        slot = _slot()
+        slot._empty_response_retries = 2
+
+        with _quiet_sel(), patch.object(chat_runner, "is_claude_code", return_value=True):
+            await chat_runner._run_chat(
+                state, slot, "/usr/bin/python3 --version", _directive_channel_origin=True
+            )
+        await _settle(slot)
+
+        state.sessions.get_or_create.assert_awaited()
+        assert not any(
+            "not available from a linked conversation" in m.get("content", "")
+            for m in slot.messages
+        ), "path-shaped channel prose was refused as a command"
+
+    @pytest.mark.asyncio
     async def test_prompts_get_blocked_path_reports_a_sensitive_path(self, tmp_path):
         state, client = _runner_state(tmp_path)
         slot = _slot()

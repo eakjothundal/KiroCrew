@@ -53,6 +53,7 @@ from kiro_crew.dashboard.slot_buffers import (
 )
 from kiro_crew.dashboard.slot_queue_repository import (
     queue_persist_signature,
+    restore_queue_provenance,
     sanitize_restored_queue,
 )
 from kiro_crew.dashboard.state import (
@@ -1637,6 +1638,10 @@ def _rehydrate_slot_from_history(
             # so before this they simply vanished on a restart with no row and no
             # error. Nothing drains an idle slot on boot, so they wait for the
             # user to send, edit or delete them rather than running unasked.
+            # The reader above is the fail-closed half; this puts back, under the
+            # gateway's own proof, the admission snapshot and channel address of
+            # each entry it can vouch for -- before any drain re-validates them.
+            restore_queue_provenance(slot, _restored_queue, meta.get("queued_prompts"))
             slot._queue[:] = _restored_queue
             logger.info("Restored %d queued prompt(s) for slot %s", len(_restored_queue), slot_name)
         # Stamped whatever was restored (including nothing), so the first flush
@@ -2253,7 +2258,9 @@ def _apply_recent_session(
         slot._deferred_notes = restored_notes
     _restored_queue = sanitize_restored_queue(meta.get("queued_prompts"))
     if _restored_queue:
-        # Mirror of the hand-back in _rehydrate_slot_from_history.
+        # Mirror of the hand-back in _rehydrate_slot_from_history, provenance
+        # step included.
+        restore_queue_provenance(slot, _restored_queue, meta.get("queued_prompts"))
         slot._queue[:] = _restored_queue
         logger.info("Restored %d queued prompt(s) for slot %s", len(_restored_queue), slot_name)
     slot._queue_persisted_sig = queue_persist_signature(slot.durable_queue_entries())

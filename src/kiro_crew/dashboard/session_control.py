@@ -965,6 +965,10 @@ _CONTAINMENT_CHANGE_LABELS = {
     "app": "the session became app-scoped",
     "unattended": "the session became unattended",
     "workspace": "the session moved to a different workspace",
+    # Recorded by the drain for a channel hand-off (``channel_busy``), not by
+    # :func:`newly_held_constraints`: the conversation that queued the entry
+    # stopped resuming the session, so its reply route is gone.
+    "unlinked": "the channel conversation that queued it left the session",
 }
 
 
