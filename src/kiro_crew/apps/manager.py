@@ -461,6 +461,47 @@ def _is_generated_deps_artifact_name(n: str) -> bool:
     )
 
 
+#: Root entries the GATEWAY owns in the installed app directory, so a source
+#: entry of that name never reaches it verbatim whatever its type: ``data`` is
+#: the app's data directory -- :func:`update_app` puts the PRESERVED previous
+#: one back over whatever the source shipped there, and a source FILE so named
+#: makes :func:`app_data_dir`'s ``mkdir`` fail before an install completes --
+#: and ``.app_secret`` is written by the gateway after the copy
+#: (``write_app_secret``) and preserved over the copied one on update. The
+#: install-time metadata file is the third gateway-owned name and already in
+#: :data:`_COPY_IGNORE`.
+_GATEWAY_OWNED_ROOT_ENTRIES = ("data", ".app_secret")
+
+
+def carried_into_app_dir(relative: Path) -> bool:
+    """True when a source-tree path (relative to the app root) reaches the app
+    directory verbatim through :func:`_copy_app_tree` and an update -- that is,
+    when the INSTALLER carries it and nothing of the gateway's or the runtime's
+    replaces it there.
+
+    The two ways it does not: some component on its way -- the LEAF included,
+    because the copy's ``ignore`` callback drops by name whatever the entry's
+    type, so a regular file called ``node_modules`` is dropped like the
+    directory would be -- is one the copy drops at any depth
+    (:data:`_COPY_IGNORE`, the generated deps artifacts -- the callback's own
+    test; these are the RUNTIME's, provisioned after the install and never the
+    installer's to copy), or its first component is one the gateway owns in the
+    installed directory (:data:`_GATEWAY_OWNED_ROOT_ENTRIES`): ``data``, file
+    or directory, and ``.app_secret``, which the gateway writes over whatever
+    the source shipped. The install-time desktop gate asks this about the
+    target of a ``requirements.txt`` link and about a declared entry point: a
+    path that resolves in the checkout but is not carried over is missing or
+    replaced in the app directory, where the provisioner reads and the spawn
+    looks -- and both refuse.
+    """
+    parts = relative.parts
+    if not parts:
+        return False
+    if parts[0] in _GATEWAY_OWNED_ROOT_ENTRIES:
+        return False
+    return not any(part in _COPY_IGNORE or _is_generated_deps_artifact_name(part) for part in parts)
+
+
 def _copy_app_tree(source: Path, dest: Path) -> None:
     """Copy an app source tree for install/update.
 
