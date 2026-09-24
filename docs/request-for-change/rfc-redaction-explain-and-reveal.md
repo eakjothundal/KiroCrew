@@ -67,7 +67,9 @@ worked correctly.
    cannot recover it from the conversation. The replacement also keeps the
    value out of Slack, artifacts, memory, sub-agents, and backups — although
    the source file, tool logs, model provider, or screenshots may still
-   contain it. There is no setting to turn this off.
+   contain it. No setting turns this off for the conversation. The owner's
+   switch under Settings → Security → Redaction (#13685) turns off only the
+   credential pass in files the dashboard opens for the owner.
 2. **The value usually remains at its source.** Removing it from the saved
    conversation does not usually remove it from the file, command output, or
    environment variable where it came from. Because the user can already read
@@ -190,8 +192,10 @@ select. The tag opens one shared type of card, which leads with three facts:
 Keep less common information closed until the user asks for it. *Technical
 details* explains which rule matched and exactly what the system protected.
 *More ways* offers *Copy path* and a pre-filled chat request that saves the
-value in a mode-0600 file, which only the owner's account can read; because
-this creates another secret copy on disk, the card must say so. A
+value in a mode-0600 file, which only the owner's account can read, and
+the owner can then open that file in the dashboard with the file-view switch
+off (#13685); because this creates another secret copy on disk, the card must
+say so. A
 false-positive report sends only the rule name and session id, and the card
 clearly says when the source is gone. Each placeholder stores the rule and
 source for that specific removed value.
@@ -217,8 +221,8 @@ execution and a prompt-injected agent could pre-fill an attack disguised as a
 
 Show this guidance once, after the first answer that contains a removed value.
 It explains that the values were replaced before saving, so no saved
-conversation copy contains them, the product cannot show them, and no setting
-can change this behavior. It also explains that each lock tag names the likely
+conversation copy contains them, the conversation cannot show them, and no
+setting changes this for the conversation. It also explains that each lock tag names the likely
 source and tells the user how to view it. End with: "Keep secrets at their
 source. Your messages are saved exactly as typed." Keep extra details under
 *Learn more*; after the user selects *Got it*, show only the small lock tag.
@@ -383,8 +387,8 @@ copied code blocks, and copying should turn each marker into `<REDACTED>`. Use
 the same blocked-link chip in every version. Keep the existing placeholder tag
 and store that value's rule and source in its metadata. Only the session owner
 sees actions; Slack and other shared pages show explanatory text without
-actions. On phones the cards open as bottom sheets; on desktop they open
-beside the message.
+actions. On phones and desktop alike, a card opens inline, below the block it
+explains.
 
 ## What does not change
 
@@ -419,7 +423,9 @@ beside the message.
    list of exact hosts that can bypass only the long-query and base64 checks.
 6. Add a read-only Redaction section under Settings → Security that shows
    groups of rules, recent match counts, and allowed hosts, while clearly
-   stating that redaction cannot be turned off.
+   stating that redaction in chat and messaging channels is always on. The
+   same section holds the owner's file-view switch from #13685, so the note
+   says that switch covers only files the dashboard opens for the owner.
 
 Each step can be released or rolled back without requiring the later steps.
 Steps 1 and 3 ship together in one implementation PR: the renderer rules

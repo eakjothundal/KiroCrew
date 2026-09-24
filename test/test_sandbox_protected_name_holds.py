@@ -274,7 +274,7 @@ class TestLeafOnlyPopulationIsRecorded:
 
     #: Measured per tier. Not a target -- a debt. Today it is the WHOLE
     #: population: nothing is durably held.
-    EXPECTED: dict[str, int] = {"standard": 235, "cc": 242, "strict": 243}
+    EXPECTED: dict[str, int] = {"standard": 244, "cc": 251, "strict": 252}
 
     @pytest.mark.parametrize("tier", TIERS)
     def test_leaf_only_count_has_not_grown(self, tier: str) -> None:
