@@ -50,6 +50,7 @@ from kiro_crew import (
     dep_sync,
     name_grant,
     platform_compat,
+    session_work_dir,
     shutdown_event,
     work_root,
 )
@@ -94,6 +95,7 @@ from kiro_crew.config.loader import (
     build_provider_factory,
     config_dir,
     data_home,
+    workspace_root,
 )
 from kiro_crew.config.paths import kiro_agents_dir
 from kiro_crew.constants import DATA_WARNING, SUBAGENT_COMPLETION_META_KEY, strip_control_comments
@@ -606,6 +608,13 @@ _BACKGROUND_APPROVAL_SOURCES = frozenset({"cron", "heartbeat", "taskrunner", "au
 # Slack Block Kit section.text hard limit is 3000 chars.
 # We split cron output at this boundary so each chunk fits in a section block.
 _CRON_MSG_LIMIT = 3000
+
+
+def _sweep_disposable_session_work_dirs(live_work_dirs: list[str]) -> int:
+    """Resolve the workspace and sweep disposable run directories off-loop."""
+    return session_work_dir.sweep_disposable_work_dirs(
+        workspace_root(), live_work_dirs=live_work_dirs
+    )
 
 
 def _heartbeat_slack_parts(title: str, result_text: str) -> list[str]:
@@ -15462,6 +15471,29 @@ async def run_gateway(
                     await asyncio.to_thread(work_root.sweep_work_root)
                 except Exception:
                     logging.getLogger(__name__).debug("work-root sweep failed", exc_info=True)
+                # The per-run work directories of subagent and stateless cron
+                # sessions ride the same wake. The ordinary end of a run reclaims
+                # its own (AcpProvider.shutdown); this catches the ones a crash, a
+                # gateway restart or an older build left behind. Liveness is the
+                # session registry: a directory a registered provider names is
+                # skipped whatever it holds, and the grace window covers a spawn
+                # whose provider is not registered yet. ``orchestrator`` is bound
+                # later in this function and read only here, an hour in.
+                try:
+                    sessions = getattr(orchestrator, "sessions", None)
+                    live = (
+                        [str(getattr(p, "cwd", "") or "") for p in sessions.active_providers()]
+                        if sessions is not None
+                        else []
+                    )
+                    await asyncio.to_thread(
+                        _sweep_disposable_session_work_dirs,
+                        [path for path in live if path],
+                    )
+                except Exception:
+                    logging.getLogger(__name__).debug(
+                        "session work-dir sweep failed", exc_info=True
+                    )
 
         _AGENT_SCRATCH_SWEEP_TASK = asyncio.create_task(
             _run_agent_scratch_sweep(), name="agent-scratch-sweep"

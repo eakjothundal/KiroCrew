@@ -76,7 +76,76 @@ and the view content, so every spawn from that home that derives the same view
 an existing alias whose bytes already match. Views can still differ per
 workspace: a SCOPE_PROJECT agent's prompt path and workspace-local inheritance
 shape the view, so those agents get
-one alias per workspace. Each run caps reclaims at `_PRUNE_MAX_RECLAIMS_PER_RUN` plus the number
+one alias per workspace. A run's work directory is reclaimed separately (`session_work_dir`): the
+provider factory marks a work directory it DERIVED from an exact generated
+one-run key -- `subagent:<16 hex>` from `SubagentManager._mint_agent_id` (eight hex on
+the shipped builds whose directories the sweep also recognises), or
+`cron:<8 hex job>:<8 hex run>` from `build_cron_session_context` -- never a
+caller-supplied `cwd`. The key predicate and corresponding directory-name regex
+come from one shared shape table; stable `cron:<job>:<agent>` keys are not
+one-run directories. `AcpProvider.start` writes a `.kirocrew-run-dir` marker before any other writer,
+then adds the spawned ACP root identity as soon as startup returns. Line one remains
+the deriving gateway's pid; line two is compact JSON containing the child root pid
+and its persistable process-start token (or `null` when identity cannot be read).
+That marker is the directory's only provenance: a name under the workspace root
+is not one (a person can make `subagent_deadbeef` there), and the content of
+`cli.json` is not one either, because the projection merges its keys into a file
+that already exists. A marker already naming this gateway is idempotent; a
+predecessor whose gateway and recorded child identities are confirmed gone may be
+replaced after restart, while live, incomplete, or malformed foreign evidence is
+left unchanged and the session continues without a
+sweepable mark. Marker reads use the same bounded discipline as agent scratch:
+links are refused, the no-follow descriptor must name a regular file no larger
+than 4 KiB, and every pid must be in the kernel pid range. Unknown record shapes
+fail closed. A dead foreign gateway with no child record is also retained because
+it may have crashed after spawning but before recording; that ambiguous residue
+requires explicit operator diagnosis. This gateway may reclaim its own owner-only
+pre-spawn marker.
+`AcpProvider.shutdown` removes a marked-by-flag directory only after its client
+positively confirms the root and every tracked child exited, and when it holds
+only Crew's own residue (`.kiro/settings/` with `cli.json` and its lock sidecar,
+plus the marker). The factory flag permits an absent marker on this shutdown
+path, so a transient marker-write refusal does not make the directory
+permanently unsweepable. When a marker is present, the reclaim reads it through
+the same bounded descriptor path as the sweep and proceeds only when the gateway
+is this process or confirmed dead AND the recorded child root is confirmed dead.
+A live pid authorizes reclaim only when its readable start token differs from the
+recorded token, proving pid reuse. A matching token, an unreadable token, an
+unsignalable pid, malformed evidence, or a live foreign gateway keeps the directory.
+An unknown or surviving process tree also keeps the directory for the hourly sweep.
+The flag says the directory was derived from a
+one-run KEY, not that this instance is the one the registry kept for it, so
+registration installs a fail-closed ownership claim on the provider. At final
+reclaim that claim holds the session registry lock from the check through the
+off-loop filesystem operation. It refuses while another registered provider
+names the same key or cwd, or while an allocation reservation names the key; a
+successor that has not registered yet is therefore fenced too, and one beginning
+after the claim waits until the old residue is gone before its own start
+recreates the tree. No installed claim, or a claim that raises, keeps the
+directory for the sweep.
+Where the session registry already knows a provider lost ownership -- the loser of
+a cold-start race, a recycled session whose successor is already registered, or
+the bootstrap provider that borrowed a parent's key -- it still calls
+`disown_work_dir()` first as the cheaper one-way early exit. The final claim is the
+authoritative race guard for every pop-then-shutdown arm; the early exit can only
+preserve more, never authorize a deletion. Only Crew's residue names are ever
+unlinked and every directory goes through `rmdir`, so a run that wrote anything
+into its cwd keeps the whole tree. The gateway's hourly maintenance
+wake sweeps `workspace_root()` for the directories a crash or a restart left
+behind, taking only directories that carry a readable owner marker, skipping any
+a registered provider still names and any whose newest mtime is inside a grace
+window, and reclaiming a foreign gateway's directory only when both its gateway
+and recorded child-tree identities are confirmed gone. A marker naming this process
+defers to its provider registry,
+so two gateways on separate data homes but one default workspace root cannot
+sweep each other's live runs. Each wake is bounded by entries and wall clock,
+and streams the listing so a root
+of any size costs it counters, not a list. Directories older builds left carry
+no marker and are never reclaimed automatically; `kirocrew doctor` counts them
+and names the manual remedy, as it does for the alias backlog, resolving the
+workspace root without creating it (`workspace_root(create=False)`) so the
+read-only report leaves no tree behind on a host where no gateway ever ran.
+Each run caps reclaims at `_PRUNE_MAX_RECLAIMS_PER_RUN` plus the number
 of aliases it publishes. Aliases published by builds that predate this lifecycle carry NO
 record of either kind, so an ownership-keyed reclaim alone would leave the entire
 accumulated backlog on disk and bound only post-upgrade growth -- which is the
@@ -137,9 +206,14 @@ under the publication lock in a loop, pausing between batches for longer than
 the lock's poll cap so a waiting spawn can take the lock. A batch that cannot
 take the lock counts as one that reclaimed nothing. It stops after
 `_DRAIN_IDLE_BATCHES` consecutive batches that reclaim nothing, each from a
-fresh start offset, or at `_DRAIN_MAX_BATCHES`.
-
-Projected agent JSON contains only fields accepted by Kiro's strict
+fresh start offset, or at `_DRAIN_MAX_BATCHES`. A reclaim
+the filesystem itself refuses -- a read-only mount, an agents directory this
+process cannot write -- is reported as a warning naming the directory, the
+operation and the errno, at most once per interval with the count of refusals
+it stands for; only `EACCES`, `EPERM` and `EROFS` are diagnosed as an unwritable
+directory, and any other errno (`ENOENT` from a concurrent prune elsewhere,
+`EMFILE`) is reported by name with no such diagnosis. Every other `False`
+from the unlink is a deliberate keep and stays at debug. Projected agent JSON contains only fields accepted by Kiro's strict
 schema; lifecycle ownership lives in the non-spec
 `.kirocrew-skill-projection-metadata` directory. Each sidecar records the alias's
 exact byte digest, so a stale or replaced sidecar cannot authorize deletion of a

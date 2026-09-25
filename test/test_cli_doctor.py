@@ -4143,3 +4143,44 @@ class TestDoctorSkillViewCensus:
         line = self._line(self._run(tmp_path, monkeypatch, capsys))
         assert f"{skill_projection._PROJECTION_METADATA_DIR_NAME}/ directory" in line
         assert f"in {skill_projection._PROJECTION_LEASE_DIR_NAME}/ cannot be read" in line
+
+
+class TestUnmarkedRunDirs:
+    """The run-directory census is read-only, down to the workspace root itself.
+
+    ``workspace_root()`` creates the tree it resolves, which is right for a
+    gateway about to spawn into it and wrong for a doctor on a host where no
+    gateway ever ran: the report would leave a workspace behind as its only
+    trace. The doctor resolves without creating and says there is nothing yet.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, capsys, root: Path) -> str:
+        monkeypatch.setenv("KIROCREW_WORKSPACE", str(root))
+        cli_doctor._doctor_unmarked_run_dirs()
+        return capsys.readouterr().out
+
+    def test_a_workspace_root_that_does_not_exist_is_not_created(
+        self, tmp_path: Path, monkeypatch, capsys
+    ) -> None:
+        root = tmp_path / "never-ran" / "kirocrew-workspace"
+        out = self._run(monkeypatch, capsys, root)
+        assert not root.exists(), "the doctor created the workspace tree"
+        assert not root.parent.exists()
+        assert "run dirs:" in out and "no workspace root yet" in out
+
+    def test_an_existing_root_is_still_counted(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        from kiro_crew.session_work_dir import RUN_DIR_MARKER
+
+        root = tmp_path / "ws"
+        legacy = root / "subagent_deadbeef" / ".kiro" / "settings"
+        legacy.mkdir(parents=True)
+        (legacy / "cli.json").write_text("{}", encoding="utf-8")
+        marked = root / "subagent_cafef00d"
+        marked.mkdir()
+        (marked / RUN_DIR_MARKER).write_bytes(b"")
+        out = self._run(monkeypatch, capsys, root)
+        assert (
+            f"1 run director(ies) under {os.path.realpath(root)} carry no {RUN_DIR_MARKER}" in out
+        )
+        assert "no workspace root yet" not in out

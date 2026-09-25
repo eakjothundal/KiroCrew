@@ -4197,6 +4197,55 @@ def _doctor_agents_janitor(issues: list[str], sweep_backups: bool) -> None:
     else:
         print("  janitor:     ✅ no stale temp/backup files to reclaim")
     _doctor_skill_view_census(agents_dir)
+    _doctor_unmarked_run_dirs()
+
+
+# Unmarked run directories above which the doctor warns. Each is one directory
+# holding one small file; the count matters as a listing cost on the workspace
+# root, which every derived-cwd spawn's ``mkdir`` re-enumerates.
+_RUN_DIR_BACKLOG_WARN = 1000
+
+
+def _doctor_unmarked_run_dirs() -> None:
+    """Report run directories the hourly sweep will never reclaim.
+
+    Advisory and read-only. A subagent or stateless cron run gets a directory
+    under the workspace root that the provider marks at first start and reclaims
+    at shutdown, and the gateway sweeps marked leftovers hourly. Directories
+    from builds that wrote no marker are exactly what the sweep refuses -- a
+    name is not provenance, and the sweep deletes nothing it cannot prove Crew
+    made -- so they stay until an operator moves them. Named here, never done:
+    the doctor cannot prove who made a directory that merely carries the shape.
+    """
+    from kiro_crew.config.loader import workspace_root
+    from kiro_crew.session_work_dir import DERIVED_NAME_RE, RUN_DIR_MARKER, count_unmarked_run_dirs
+
+    try:
+        # Resolve only: the default resolver creates the tree, and a read-only
+        # report must not leave a workspace behind where no gateway ever ran.
+        root = workspace_root(create=False)
+    except OSError:
+        return
+    if not root.is_dir():
+        print("  run dirs:    ✅ no workspace root yet, so no run directories")
+        return
+    unmarked, floor = count_unmarked_run_dirs(root)
+    if not unmarked:
+        print("  run dirs:    ✅ no unmarked run directories left behind")
+        return
+    suffix = "+" if floor else ""
+    warn = unmarked > _RUN_DIR_BACKLOG_WARN
+    print(
+        f"  run dirs:    {'⚠️ ' if warn else '✅'} {unmarked}{suffix} run director(ies) under "
+        f"{root} carry no {RUN_DIR_MARKER} marker (left by a build that wrote none)"
+    )
+    if not warn:
+        return
+    print(
+        f"{_INDENT}The gateway reclaims only marked run directories. With the gateway stopped,"
+        f" move directories matching {DERIVED_NAME_RE.pattern} that hold only"
+        f" .kiro/settings/cli.json out of {root}; a live run recreates its own."
+    )
 
 
 def _doctor_skill_view_census(agents_dir: Path) -> None:
