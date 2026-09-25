@@ -305,17 +305,31 @@ class TranscriptReadProjection:
             )
         return messages
 
-    def read_messages_chained(self, key: str) -> list[dict]:
-        """Concatenate chronologically ordered files sharing the same tab id."""
+    def chained_keys(self, key: str) -> list[str]:
+        """Every transcript key ``read_messages_chained(key)`` concatenates, in order.
+
+        EMPTY when the key carries no ``tab_id`` or the index knows no chain for
+        it: the chained read then serves ``_read_messages(key)``'s object itself
+        (on a cache hit the shared cached list, which callers treat as immutable
+        and the fork path relies on by identity), while any indexed chain -- a
+        single member included -- builds a fresh concatenation, exactly as
+        before. Exposed so a caller that must validate or lock EVERY file the
+        chained read touches (the derivation seam) can name them before reading;
+        such a caller reads an empty result as ``[key]``.
+        """
         metadata = self._log.get_metadata(key)
         tab_id = metadata.get("tab_id")
         if not tab_id:
-            return self._log._read_messages(key)
+            return []
         with self._log._lock:
             if self._log._tab_id_index is None:
                 self._log._rebuild_tab_id_index()
             index = self._log._tab_id_index or {}
-            keys = list(index.get(tab_id, []))
+            return list(index.get(tab_id, []))
+
+    def read_messages_chained(self, key: str) -> list[dict]:
+        """Concatenate chronologically ordered files sharing the same tab id."""
+        keys = self.chained_keys(key)
         if not keys:
             return self._log._read_messages(key)
         messages: list[dict] = []

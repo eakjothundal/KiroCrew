@@ -923,7 +923,9 @@ class HistoryConsolidator:
                 return _CONSOLIDATION_REFUSED
 
             from kiro_crew.execution_context import read_session_execution
-            from kiro_crew.history import is_incognito_transcript
+
+            # circular import: kiro_crew.history re-exports this module
+            from kiro_crew.history import TranscriptWithheld, is_incognito_transcript
 
             execution = await asyncio.to_thread(read_session_execution, key)
             if execution is not None and execution.memory_mode != "persistent":
@@ -942,11 +944,22 @@ class HistoryConsolidator:
             # dropping messages from extraction. Offloaded to a worker thread:
             # _consolidate runs on the gateway event loop and _locked/file IO is
             # blocking (same rationale as the mark_consolidated offload below).
-            (
-                unconsolidated,
-                total,
-                generation_at_snapshot,
-            ) = await asyncio.to_thread(self._log.snapshot_for_consolidation, key)
+            # ``withhold_restricted``: the two privacy checks above read the line
+            # BEFORE this snapshot, and a writer can tighten it in between (a
+            # same-key hand-over landing a restricted tab's rows under a line
+            # that was persistent a moment ago). The snapshot re-reads the line
+            # under the same lock as the rows and refuses them together, so no
+            # rows a restricted line governs ever reach the prompt below.
+            try:
+                (
+                    unconsolidated,
+                    total,
+                    generation_at_snapshot,
+                ) = await asyncio.to_thread(
+                    self._log.snapshot_for_consolidation, key, withhold_restricted=True
+                )
+            except TranscriptWithheld:
+                return _CONSOLIDATION_REFUSED
             # Transcript caches may share nested message dictionaries with an
             # editor. Freeze the submitted evidence before awaiting the model.
             unconsolidated = copy.deepcopy(unconsolidated)
@@ -1293,9 +1306,20 @@ class HistoryConsolidator:
             # edited transcript, or outrank a newer user turn. Appended assistant
             # replies may remain unconsolidated without invalidating the original
             # span. Recheck at the write boundary, before history or fact changes.
-            latest, latest_total, latest_generation = await asyncio.to_thread(
-                self._log.snapshot_for_consolidation, key
-            )
+            # Same gate at the write boundary: a line tightened while the model
+            # was thinking makes this result one derived from a restricted
+            # transcript, so it is discarded -- nothing reaches history or memory.
+            try:
+                latest, latest_total, latest_generation = await asyncio.to_thread(
+                    self._log.snapshot_for_consolidation, key, withhold_restricted=True
+                )
+            except TranscriptWithheld:
+                self._logger.info(
+                    "Discarding consolidation result for %s: the transcript became restricted "
+                    "during extraction",
+                    key,
+                )
+                return _CONSOLIDATION_REFUSED
             if (
                 latest_generation != generation_at_snapshot
                 or latest_total < total
@@ -1521,7 +1545,16 @@ class HistoryConsolidator:
         """
         if self._skills_loader is None:
             return
-        all_messages = await asyncio.to_thread(self._log._read_messages, key)
+        # circular import: kiro_crew.history re-exports this module
+        from kiro_crew.history import TranscriptWithheld
+
+        # Through the derivation seam: a third read of the transcript, so the line
+        # is validated with THESE rows under the lock (the consolidation snapshots
+        # above vouched for their own rows, not these).
+        try:
+            all_messages = await asyncio.to_thread(self._log.derive_messages, key)
+        except TranscriptWithheld:
+            return
         if not all_messages:
             return
         # Key the guard on (rotation generation, message count), NOT count

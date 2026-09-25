@@ -115,6 +115,7 @@ from kiro_crew.dashboard.chat_utils import (
 )
 from kiro_crew.dashboard.state import MAX_LIVE_SLOTS, DashboardState, _ChatSlot
 from kiro_crew.dashboard.token_auth import effective_request_app
+from kiro_crew.history import TranscriptWithheld  # noqa: F401 - re-exported to the bundle's callers
 from kiro_crew.security import (
     redact_credentials,
     redact_exfiltration_urls,
@@ -272,9 +273,19 @@ def _read_chained_history(state: DashboardState, session_key: str) -> list[dict]
 
     Split out so a caller on the event loop can push it to a thread; see
     :func:`build_transfer_bundle_async`.
+
+    Read through the DERIVATION seam (:meth:`ConversationLog.derive_messages_chained`),
+    which validates the file's own privacy contract under the same lock as the
+    rows and raises :class:`~kiro_crew.history.TranscriptWithheld` for a
+    restricted or unreadable line. The callers (the file export, the tunnel send)
+    each already refuse a slot whose LIVE ``memory_mode`` is restricted; the seam
+    is the same refusal for the FILE, because a live slot can lag its file -- a
+    same-key persistent recreation of a closed restricted tab, or another writer
+    tightening the line while the slot still reads persistent in memory. Nothing
+    has been built or sent when it raises; the source is untouched.
     """
     if state.conversation_log:
-        return state.conversation_log.read_messages_chained(session_key)
+        return state.conversation_log.derive_messages_chained(session_key)
     return []
 
 

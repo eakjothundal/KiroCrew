@@ -22,8 +22,12 @@ from typing import TYPE_CHECKING, Any
 
 from kiro_crew.acp.types import STOP_REASON_END_TURN
 from kiro_crew.config.loader import KiroCrewConfig
-from kiro_crew.dashboard.chat_utils import effective_session_key, slot_history_key
-from kiro_crew.history import is_incognito_transcript
+from kiro_crew.dashboard.chat_utils import (
+    apply_pending_slot_memory_mode,
+    effective_session_key,
+    slot_history_key,
+)
+from kiro_crew.history import TranscriptWithheld, is_incognito_transcript
 from kiro_crew.llm_helpers import _extract_json_of_type, run_bg_oneliner
 from kiro_crew.session_summary import (
     count_user_turns,
@@ -317,6 +321,9 @@ async def _generate_locked(
     # left the slot dirty would just be re-saved by the loop moments later,
     # moving the mtime again and refusing the payload regardless.
     await asyncio.to_thread(state.flush_slot_now, slot)
+    # The flush may have folded the line's mode stricter than the slot's own;
+    # let the slot follow before the row read so the live gates agree with it.
+    apply_pending_slot_memory_mode(state, slot)
 
     # Capture the cache signature BEFORE reading the transcript. The signature
     # must be at least as old as the snapshot it stamps: any append landing
@@ -342,7 +349,19 @@ async def _generate_locked(
     # sidecar -- earlier intents would silently vanish from the panel. Disk is
     # the same source the history endpoint serves, and extract_turns bounds
     # what the model actually reads.
-    records = await asyncio.to_thread(log.read_messages_chained, key)
+    #
+    # Through the DERIVATION seam, not the plain read: the rows come from disk,
+    # so the file's own privacy contract gates them, not only the live slot's
+    # mode the first pass checked -- another writer (a second gateway on this
+    # data home, a same-key hand-over, a subagent or cron appending) may have
+    # tightened the line while this slot still reads persistent in memory. The
+    # seam validates the line and reads the rows under one lock hold and raises
+    # instead of yielding rows a restricted (or unreadable) line governs.
+    try:
+        records = await asyncio.to_thread(log.derive_messages_chained, key)
+    except TranscriptWithheld:
+        logger.debug("Session summary skipped for %s: memory_mode (on-disk line)", key)
+        return False
     turns = extract_turns(
         records,
         assistant_excerpt_chars=cfg.session_summary.assistant_excerpt_chars,

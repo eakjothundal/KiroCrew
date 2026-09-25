@@ -38,6 +38,7 @@ from kiro_crew.dashboard.chat_utils import (
     _normalize_model,
     _redact_meta_for_role,
     _sync_dashboard_slots,
+    apply_pending_slot_memory_mode,
     effective_session_key,
     redact_display_content,
     session_key_for,
@@ -66,6 +67,7 @@ from kiro_crew.dashboard.state import (
 )
 from kiro_crew.effort import EFFORT_LEVELS, EFFORT_VALUES
 from kiro_crew.execution_context import (
+    EXECUTION_CONTEXT_KEY,
     MEMORY_MODES,
     canonical_memory_mode,
     read_session_execution,
@@ -3358,6 +3360,57 @@ def _frozen_prefix_and_foreign_appends(
     return (prefix, foreign, dedup_dropped)
 
 
+def _tighten_carried_execution(meta_line: dict, mode: str) -> None:
+    """Fold *mode* into a carried durable execution record on ``meta_line``.
+
+    A persistent session's execution carrier is DURABLE: ``bind_session_execution``
+    writes it into the metadata line under ``execution_context``, with a
+    ``memory_mode`` of its own, and ``read_session_execution`` answers from that
+    record when no live carrier exists. The save carries the record rather than
+    owning it, so when the line's ``memory_mode`` is ratcheted to a stricter value
+    -- a restricted original's rows landing under a persistent same-key
+    replacement's line -- the record would keep saying ``persistent`` and every
+    reader of the session's execution would take the looser mode from it. The
+    record is a ratchet like the line: it is only ever tightened, never rebuilt,
+    so the identity it carries is untouched and a record that is already at least
+    as strict is left exactly as it was. A malformed record is left alone too --
+    the read path refuses it on its own terms, and a save is not where to judge it.
+    """
+    if mode == "persistent":
+        return
+    payload = meta_line.get(EXECUTION_CONTEXT_KEY)
+    if not isinstance(payload, dict):
+        return
+    record_mode = canonical_memory_mode(payload.get("memory_mode"))
+    retained = stricter_memory_mode(record_mode, mode)
+    if retained == record_mode:
+        return
+    meta_line[EXECUTION_CONTEXT_KEY] = {**payload, "memory_mode": retained}
+
+
+# One lock for every save thread's pending-mode fold. Two saves of one slot can
+# complete on different worker threads (the full save records inside the
+# transcript lock, the empty-window merge after ``update_metadata_if`` returns),
+# and the fold is a read-then-write: without the lock the later, stricter value
+# could be overwritten by an earlier completion's looser one. The value itself
+# is monotonic -- it only ever moves to a stricter mode and the loop-side
+# consumer never clears it -- so holding this lock for the fold is all the
+# ordering the seam needs.
+_PENDING_MEMORY_MODE_LOCK = threading.Lock()
+
+
+def _record_pending_memory_mode(slot: _ChatSlot, memory_mode: str) -> None:
+    """Record a committed line tightening without mutating loop-affine state."""
+    with _PENDING_MEMORY_MODE_LOCK:
+        current = canonical_memory_mode(getattr(slot, "memory_mode", "persistent"))
+        pending = getattr(slot, "_pending_memory_mode", None)
+        folded = stricter_memory_mode(current, canonical_memory_mode(memory_mode))
+        if pending is not None:
+            folded = stricter_memory_mode(folded, canonical_memory_mode(pending))
+        if folded != current:
+            slot._pending_memory_mode = folded
+
+
 def _save_slot_to_history(
     state: DashboardState,
     slot: _ChatSlot,
@@ -3881,6 +3934,8 @@ def _save_slot_to_history(
                 raise OSError(
                     f"empty-window metadata merge skipped: record unreadable for {history_key}"
                 )
+            if applied:
+                _record_pending_memory_mode(slot, merged_fields["memory_mode"])
             if applied and slot_history_key(slot) == history_key:
                 # The queued prompts this merge committed are now durable, so
                 # the flush's drift check must stop reporting them as owed. Same
@@ -4397,32 +4452,6 @@ def _save_slot_to_history(
             # Decided at the stale-queue guard above, which needs the same answer
             # to know whether this save is deciding the queue at all.
             if rows_only and existing_meta and not line_is_this_slots:
-                # The deferred fields include ``memory_mode``, and that one is the
-                # line's privacy contract: every reader that learns from the file
-                # gates on it. A restricted original handing its unsaved tail to a
-                # PERSISTENT same-key replacement would file private rows under a
-                # line that says persistent, and consolidation, the history tools
-                # and the summary would then treat them as ordinary content. The
-                # line cannot be tightened from here either: it is the live
-                # replacement's own, describing that slot's persistent rows, and a
-                # rows-only write owns none of its fields. So the write is refused
-                # -- ``False``, nothing written -- and the drain reports the rows
-                # as lost, which is the loss the mode chose over disclosure. Only
-                # a STRICTER source refuses: ``_mode`` already folds the line's
-                # value in, so it differs from the line exactly when the source is
-                # stricter; a persistent original over a restricted replacement's
-                # line keeps the line's stricter value, as stricter-wins requires.
-                line_mode = line_memory_mode(existing_meta)
-                if _mode != line_mode:
-                    logger.warning(
-                        "Slot %s save refused: %d unsaved %s row(s) would be filed under "
-                        "another holder's %s line",
-                        slot.key,
-                        len(window),
-                        _mode,
-                        line_mode,
-                    )
-                    return False
                 # A rows-only write does not own the slot-owned fields: the line
                 # describes whichever OTHER live slot published it, and this one is
                 # only here to get its messages down. Drop the rebuild for every
@@ -4439,8 +4468,51 @@ def _save_slot_to_history(
                 for meta_key in ROWS_ONLY_DEFERRED_META_KEYS:
                     meta_line.pop(meta_key, None)
                 carry_unowned_metadata(meta_line, existing_meta, ROWS_ONLY_OWNED_META_KEYS)
+                # ``memory_mode`` is deferred with the rest, but it is the line's
+                # privacy contract -- every reader that learns from the file gates
+                # on it -- and the contract is a RATCHET that any writer may
+                # tighten. A restricted original handing its unsaved tail to a
+                # PERSISTENT same-key replacement (one that published its own line
+                # before the original ever committed one) must not file private
+                # rows under a line that says persistent, and it must not drop
+                # them either: the rows are the reply the user was watching, and
+                # a refused write here has no retry path (the slot is popped).
+                # So the carried mode is folded with the retained one and the
+                # line is tightened to the stricter value, exactly as the
+                # replacement's own save would have been ratcheted had the
+                # original's line landed first. The two race orders then reach
+                # the same file: private rows and the replacement's rows under
+                # one restricted line, the outcome the turn-start binder already
+                # produces for a persistent slot on a restricted record. A
+                # restricted line names no store (see the full save above), so a
+                # carried ``memory_store`` is dropped with the loosening. Only a
+                # STRICTER source changes anything: ``_mode`` already folds the
+                # line's value in, so it differs from the line exactly when the
+                # source is stricter; a persistent original over a restricted
+                # replacement's line keeps the line's value untouched.
+                line_mode = line_memory_mode(existing_meta)
+                if _mode != line_mode:
+                    logger.info(
+                        "Slot %s save tightened another holder's %s line to %s: %d "
+                        "unsaved %s row(s) land under the stricter mode",
+                        slot.key,
+                        line_mode,
+                        _mode,
+                        len(window),
+                        _mode,
+                    )
+                    meta_line["memory_mode"] = _mode
+                    meta_line.pop("memory_store", None)
+                # The carried durable execution record must never read looser
+                # than the line it sits on; fold the (possibly just ratcheted)
+                # mode into it. A no-op on a record already at least as strict.
+                _tighten_carried_execution(meta_line, _mode)
             else:
                 carry_unowned_metadata(meta_line, existing_meta, SLOT_OWNED_META_KEYS)
+                # The durable execution record is carried, not owned, and it
+                # holds a ``memory_mode`` of its own. The line's mode was just
+                # ratcheted above; the record must never read looser than it.
+                _tighten_carried_execution(meta_line, _mode)
             meta_str = json.dumps(meta_line) + "\n"
 
             # ── Frozen prefix (never rewritten) + freshly serialized window ──
@@ -4560,6 +4632,7 @@ def _save_slot_to_history(
                     _preserve_mtime = None
 
             atomic_write(path, payload, fsync=True)
+            _record_pending_memory_mode(slot, _mode)
             # The write committed: the deferred-note drop records it retired
             # are now safe to consume (see the meta build above). Discard is
             # idempotent, and a record consumed here can no longer be needed —
@@ -5035,7 +5108,7 @@ async def save_slot_off_loop(
         if guarded_metadata:
             _begin_guarded_metadata_write()
         try:
-            return await _dispatch_to_worker(loop)
+            result = await _dispatch_to_worker(loop)
         except Exception:  # noqa: BLE001 - best-effort durable copy
             # See the inline branch above: re-arm the periodic flush so a
             # swallowed metadata/message save is retried rather than lost.
@@ -5043,7 +5116,11 @@ async def save_slot_off_loop(
             logger.warning(
                 "save_slot_off_loop: offloaded save failed slot=%s", slot.key, exc_info=True
             )
+            apply_pending_slot_memory_mode(state, slot)
             return True
+        else:
+            apply_pending_slot_memory_mode(state, slot)
+            return result
         finally:
             if guarded_metadata:
                 _finish_guarded_metadata_write()
@@ -5052,7 +5129,9 @@ async def save_slot_off_loop(
     if guarded_metadata:
         _begin_guarded_metadata_write()
     try:
-        return await _dispatch_to_worker(loop)
+        result = await _dispatch_to_worker(loop)
+        apply_pending_slot_memory_mode(state, slot)
+        return result
     finally:
         if guarded_metadata:
             _finish_guarded_metadata_write()

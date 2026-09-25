@@ -17,13 +17,17 @@ compatibility or egress claims rather than "the feature works":
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 from types import SimpleNamespace
 
 import pytest
+from chat_test_helpers import _make_state
 
 from kiro_crew.dashboard import session_export as se
+from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
+from kiro_crew.dashboard.chat_utils import slot_history_key
 from kiro_crew.dashboard.session_transfer import (
     _SUPPORTED_BUNDLE_VERSIONS,
     BUNDLE_VERSION,
@@ -31,14 +35,30 @@ from kiro_crew.dashboard.session_transfer import (
     build_source_record,
     build_transfer_bundle_async,
 )
+from kiro_crew.history import TranscriptWithheld, is_incognito_transcript
 
 
 class _FakeLog:
-    def __init__(self, messages):
+    def __init__(self, messages, *, metadata=None, readable=True):
         self._messages = messages
+        # The on-disk metadata line the export's file-level privacy gate reads.
+        # ``None`` metadata models an absent file; ``readable=False`` a line that
+        # exists but cannot be read.
+        self.metadata = {} if metadata is None else dict(metadata)
+        self.readable = readable
 
     def read_messages_chained(self, _key):
         return list(self._messages)
+
+    def get_metadata_status(self, _key):
+        return dict(self.metadata), self.readable
+
+    def derive_messages_chained(self, key):
+        """The derivation seam, as the real log implements it: line, then rows."""
+        meta, readable = self.get_metadata_status(key)
+        if not readable or is_incognito_transcript(meta.get("memory_mode")):
+            raise TranscriptWithheld("fake: restricted or unreadable")
+        return self.read_messages_chained(key)
 
 
 def _slot(messages, *, title="My session", memory_mode="persistent", app="", **over):
@@ -445,6 +465,60 @@ async def test_incognito_and_temporary_sessions_are_refused():
 
         assert resp.status == 400, mode
         assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("line_mode", ["incognito", "temporary", "Incognito"])
+async def test_a_restricted_on_disk_line_refuses_a_slot_that_still_reads_persistent(line_mode):
+    """The bundle is built from DISK, so the file's own contract gates it.
+
+    Another writer -- a second gateway on this data home, a same-key hand-over, a
+    subagent appending -- can tighten the line while this slot still reads
+    persistent in memory. The live-slot gate above passes; the file must not.
+    """
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log.metadata = {"memory_mode": line_mode}
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_on_disk_line_refuses_the_export():
+    """Fail closed: a reader that cannot see the contract does not ship the rows."""
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    state.conversation_log.readable = False
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
+
+
+@pytest.mark.asyncio
+async def test_a_line_tightened_while_the_bundle_was_built_is_refused(monkeypatch):
+    """The gate is asked again AFTER the build, so a tightening in between is caught."""
+    slot = _slot(MSGS, memory_mode="persistent")
+    state = _state(MSGS, slots={"slot-1": slot})
+    log = state.conversation_log
+    real_derive = log.derive_messages_chained
+
+    def _tighten_then_derive(key):
+        # The writer that tightens the line takes the transcript lock the seam
+        # holds, so it lands either before the seam's hold (this) or after it.
+        log.metadata = {"memory_mode": "incognito"}
+        return real_derive(key)
+
+    monkeypatch.setattr(log, "derive_messages_chained", _tighten_then_derive)
+
+    resp = await se.api_chat_slot_export(_request(state))
+
+    assert resp.status == 400
+    assert json.loads(resp.body)["code"] == "export_slot_not_persistent"
 
 
 @pytest.mark.asyncio
@@ -892,3 +966,35 @@ def test_gzip_is_deterministic_for_one_document():
     document = {"bundle_version": 2, "messages": [{"role": "user", "content": "hi", "ts": ""}]}
     assert se.gzip_bundle(document) == se.gzip_bundle(document)
     assert json.loads(gzip.decompress(se.gzip_bundle(document))) == document
+
+
+@pytest.mark.asyncio
+async def test_a_pending_line_tightening_is_applied_before_export(tmp_path, monkeypatch):
+    events = []
+
+    class _Audit:
+        def log_api_access(self, **fields):
+            events.append(fields)
+
+    monkeypatch.setattr(se, "sel", lambda: _Audit())
+    state = _make_state(tmp_path)
+    slot = state.get_or_create_slot("slot-1")
+    slot.append("user", "restricted row")
+    slot.drain()
+    assert await save_slot_off_loop(state, slot, best_effort=False)
+    await asyncio.to_thread(
+        state.conversation_log.update_metadata,
+        slot_history_key(slot),
+        {"memory_mode": "incognito"},
+    )
+    slot.append("assistant", "restricted reply")
+    slot.drain()
+
+    assert await save_slot_off_loop(state, slot, best_effort=False)
+    assert slot.memory_mode == "incognito"
+    response = await se.api_chat_slot_export(_request(state))
+
+    assert response.status == 400
+    assert json.loads(response.body)["code"] == "export_slot_not_persistent"
+    assert events[-1]["outcome"] == "denied"
+    assert events[-1]["error"] == "memory_mode=incognito"

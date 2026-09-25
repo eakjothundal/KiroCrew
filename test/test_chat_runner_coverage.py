@@ -172,8 +172,10 @@ def _runner_state(tmp_path, *, hook_store=None, context_builder=None):
     # The provider's sync accessors must NOT be AsyncMock: _run_chat calls them
     # inline and would otherwise store un-awaited coroutines in the WS payload.
     client.context_usage_pct = MagicMock(return_value=0.0)
+    client.context_usage_unknown = MagicMock(return_value=False)
     client.context_window_tokens = MagicMock(return_value=0)
     client.context_used_tokens = MagicMock(return_value=0)
+    client.mcp_session_report = MagicMock(return_value=None)
     client.last_prompt_stats = None
     client._client = client
     client.exit_code = None
@@ -243,6 +245,104 @@ async def _settle(slot) -> None:
         pass
     except Exception:  # pragma: no cover — draining, never the assertion
         pass
+
+
+@pytest.mark.asyncio
+async def test_turn_start_folds_temporary_line_over_live_incognito(tmp_path, monkeypatch) -> None:
+    """The metadata privacy ratchet outranks a looser live-first carrier."""
+    from kiro_crew import execution_context
+    from kiro_crew import history as history_mod
+
+    monkeypatch.setattr(history_mod, "_sessions_dir", lambda: tmp_path)
+    state, client = _runner_state(tmp_path)
+    slot = _slot("chat-cov-turn-ratchet")
+    slot.memory_mode = "incognito"
+    state._slots[slot.key] = slot
+    session_key = chat_runner.effective_session_key(slot)
+    live = execution_context.ExecutionContext(
+        None,
+        execution_context.MemoryStoreRef("default"),
+        "template",
+        "kirocrew",
+        "incognito",
+    )
+    execution_context.bind_session_execution(session_key, live)
+    state.conversation_log.update_metadata(session_key, {"memory_mode": "temporary"})
+    assert (
+        execution_context.read_session_execution(session_key) == live
+    ), "the fixture no longer reproduces the live-first premise"
+
+    bindings = ResolvedBindings(
+        workspace_dir=tmp_path,
+        memory_store_name="default",
+        effective_memory_config={},
+        kiro_agent="kirocrew",
+        selection_kind="template",
+    )
+    client.stream = MagicMock(return_value=_async_iter([_complete()]))
+    with patch.object(chat_runner, "resolve_agent_bindings", return_value=bindings):
+        await _drive(state, slot)
+
+    assert slot.memory_mode == "temporary", "the live slot stayed incognito"
+    assert bindings.execution_context is not None
+    assert (
+        bindings.execution_context.memory_mode == "temporary"
+    ), "the turn bindings silently re-opened memory reads"
+    assert (
+        execution_context.read_session_execution(session_key).memory_mode == "temporary"
+    ), "the live carrier was not republished at the line's stricter mode"
+    assert session_key in state._restricted_keys, "the restricted-key marker was not re-derived"
+
+
+def test_turn_start_fold_without_a_conversation_log_keeps_the_carrier(monkeypatch) -> None:
+    """A state with no transcript store has no line to fold; the carrier stands.
+
+    ``state.conversation_log`` is optional (history disabled, or a state built
+    without one -- every other consumer guards it). The fold must not dereference
+    it: doing so turned every turn into a terminal error card on such a state, and
+    the failure arm then tripped over the same missing store again.
+    """
+    from kiro_crew import execution_context
+
+    live = execution_context.ExecutionContext(
+        None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", "incognito"
+    )
+    monkeypatch.setattr(execution_context, "read_session_execution", lambda _key: live)
+
+    folded = chat_runner._read_and_tighten_turn_execution(None, "dashboard:no-log")
+
+    assert folded == live
+    assert execution_context.read_live_session_execution("dashboard:no-log") is None
+
+
+def test_turn_start_fold_withholds_on_an_unreadable_line(tmp_path, monkeypatch) -> None:
+    """A line that could not be read tightens nothing; the next turn re-reads.
+
+    ``get_metadata_status`` answering ``({}, False)`` is a transient read failure,
+    not a mode. Everything the fold publishes is a one-way ratchet (carrier, slot,
+    then the line via the save's stricter-wins), so reading the failure as
+    Temporary would permanently narrow a persistent chat over one failed read.
+    """
+    from kiro_crew import execution_context
+    from kiro_crew import history as history_mod
+
+    monkeypatch.setattr(history_mod, "_sessions_dir", lambda: tmp_path)
+    session_key = "dashboard:cov-unreadable-line"
+    live = execution_context.ExecutionContext(
+        None, execution_context.MemoryStoreRef("default"), "template", "kirocrew", "persistent"
+    )
+    execution_context.bind_session_execution(session_key, live)
+    assert execution_context.read_session_execution(session_key) == live
+    unreadable_log = MagicMock()
+    unreadable_log.get_metadata_status = MagicMock(return_value=({}, False))
+
+    folded = chat_runner._read_and_tighten_turn_execution(unreadable_log, session_key)
+
+    unreadable_log.get_metadata_status.assert_called_once_with(session_key)
+    assert folded == live, "an unreadable line tightened the turn carrier"
+    assert (
+        execution_context.read_session_execution(session_key).memory_mode == "persistent"
+    ), "an unreadable line republished the live carrier at a stricter mode"
 
 
 @pytest.mark.asyncio

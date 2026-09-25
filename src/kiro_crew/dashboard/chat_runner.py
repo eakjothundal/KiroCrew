@@ -154,6 +154,8 @@ from kiro_crew.dashboard.chat_utils import (
     parse_workflow_command,
     remember_slack_options,
     slack_mirror_is_paused,
+    tighten_live_slot_memory_mode,
+    tighten_replacement_to_restricted_original,
     user_text_span,
 )
 from kiro_crew.dashboard.handlers import (
@@ -471,6 +473,59 @@ def _require_session_memory_assignment(session_key: str, memory_store: str | Non
             "This conversation retains its member memory assignment. "
             "Restore that member binding or open a new conversation."
         )
+
+
+def _read_and_tighten_turn_execution(conversation_log: Any, session_key: str):
+    """Fold the transcript privacy line into the live turn carrier off-loop.
+
+    ``read_session_execution`` deliberately serves a live carrier without file I/O
+    because synchronous callers also use it on the event loop. Turn admission has
+    already moved to a worker thread, so this is the one read-back that can safely
+    compare the live carrier with the line and republish only a stricter mode.
+    """
+    from kiro_crew.execution_context import (
+        canonical_memory_mode,
+        read_session_execution,
+        stricter_memory_mode,
+        tighten_live_session_execution,
+    )
+
+    execution = read_session_execution(session_key)
+    if execution is None:
+        return None
+    if conversation_log is None:
+        # No transcript store at all (history disabled, or a state built without
+        # one): there is no line on disk to fold, so the carrier stands as read.
+        return execution
+    metadata, readable = conversation_log.get_metadata_status(session_key)
+    if not readable:
+        # An unreadable line is a transient read failure (fd exhaustion, a
+        # sharing violation while another writer's replace lands), not a mode.
+        # The live carrier is already at least as strict as anything this
+        # session itself established, and everything this helper publishes --
+        # the carrier, the slot, and through the next save's stricter-wins fold
+        # the line itself -- is a one-way ratchet with no widening path, so
+        # tightening from a line nobody read would turn one failed read into a
+        # permanent Temporary. The fold is withheld for this turn; the next
+        # turn's read-back tries again. Nothing is derived meanwhile: the
+        # derivation seam independently refuses to read rows from a line it
+        # cannot read.
+        return execution
+    if "memory_mode" not in metadata:
+        return execution
+    retained_mode = stricter_memory_mode(
+        canonical_memory_mode(metadata.get("memory_mode")), execution.memory_mode
+    )
+    if retained_mode == execution.memory_mode:
+        return execution
+    tightened_live = tighten_live_session_execution(session_key, retained_mode, expected=execution)
+    return tightened_live or execution.with_mode(retained_mode)
+
+
+async def _persist_tool_result_rows(state: Any, slot: Any) -> Any:
+    """Persist tool rows without leaving a same-file replacement looser."""
+    tighten_replacement_to_restricted_original(state, slot.key, slot)
+    return await save_slot_off_loop(state, slot, rows_only=True)
 
 
 def _empty_auto_continue_enabled() -> bool:
@@ -10755,6 +10810,15 @@ async def _run_chat(
                     replace_existing=previous_execution is not None,
                 )
             _require_current_binding()
+            tightened_execution = await asyncio.to_thread(
+                _read_and_tighten_turn_execution, state.conversation_log, session_key
+            )
+            _require_current_binding()
+            if tightened_execution is not None and tighten_live_slot_memory_mode(
+                state, slot.key, tightened_execution.memory_mode, expected_slot=slot
+            ):
+                execution_context = tightened_execution
+                bindings.execution_context = tightened_execution
 
         # FAIL-LOUD: an app-owned slot whose agent STILL did not resolve after the
         # self-heal must NOT run the default agent — that generic-substitution is
@@ -13089,7 +13153,7 @@ async def _run_chat(
                     # This does NOT clear `_dirty` -- only the flush passes do --
                     # so the `mcp_app_lead` flag written further below is still
                     # owed to the periodic flush exactly as before.
-                    persist_rows=lambda: save_slot_off_loop(state, slot, rows_only=True),
+                    persist_rows=lambda: _persist_tool_result_rows(state, slot),
                 )
                 _out = _render.text
                 # Rows this frame flags, by their own `ts`. That is enough HERE,

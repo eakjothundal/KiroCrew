@@ -68,6 +68,7 @@ from kiro_crew.history import (
     SEARCH_MIN_CHARS,
     ConversationLog,
     HistoryLockTimeout,
+    TranscriptWithheld,
     _archive_dir,
     is_incognito_transcript,
     transcript_lock_stems,
@@ -1619,12 +1620,23 @@ async def _summarize_one(state: DashboardState, key: str) -> str:
     cached = await loop.run_in_executor(None, log.get_cached_summary, key)
     if cached:
         return str(cached)
-    messages = await loop.run_in_executor(
-        None,
-        functools.partial(
-            log.recent, key, max_messages=_SUMMARIZE_MSG_LIMIT, roles={"user", "assistant"}
-        ),
-    )
+    # Through the DERIVATION seam, not the plain ``recent``: the line checked
+    # above is a snapshot, and a writer can tighten it before the rows are read
+    # (a same-key hand-over landing a closed restricted tab's rows). The seam
+    # validates the line with the rows under one lock hold and raises instead of
+    # yielding rows a restricted (or unreadable) line governs.
+    try:
+        messages = await loop.run_in_executor(
+            None,
+            functools.partial(
+                log.derive_recent,
+                key,
+                max_messages=_SUMMARIZE_MSG_LIMIT,
+                roles={"user", "assistant"},
+            ),
+        )
+    except TranscriptWithheld:
+        return ""
     prompt = _build_summary_prompt(messages)
     if not prompt:
         return ""
