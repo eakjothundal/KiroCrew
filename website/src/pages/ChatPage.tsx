@@ -3873,12 +3873,18 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
   // default — the backend applies `slot.reasoning_effort or agent.reasoning_effort`
   // — so the composer must show the inherited value rather than a bare
   // "Default", which read as "the model decides" and hid the real setting.
-  const { data: _defaultEffort } = useQuery({
-    queryKey: ['default-effort', provider.id],
-    queryFn: () => provider.resolveDefaultEffort(),
+  // Read from the shared ['kirocrewConfig'] entry: queries never go stale on
+  // their own here (staleTime: Infinity), and that entry is the one the
+  // Settings save writes and the server's refresh broadcast invalidates, so a
+  // change made in Settings shows without a reload.
+  const { data: _kirocrewCfg } = useQuery({
+    queryKey: ['kirocrewConfig'],
+    queryFn: () => api.kirocrewConfig(),
     enabled: provider.capabilities.reasoningEffort,
   })
-  const defaultEffort = _defaultEffort || ''
+  const defaultEffort: string = provider.capabilities.reasoningEffort
+    ? _kirocrewCfg?.agent?.reasoning_effort || ''
+    : ''
   // Effort actually in force for the active slot: per-slot override, else the
   // configured default. Display only — the slot's raw value still drives the
   // picker so "no override" stays distinguishable from an explicit pick.
