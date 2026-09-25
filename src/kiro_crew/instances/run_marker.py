@@ -94,8 +94,38 @@ def secret_file_name(port: int) -> str:
     pod's credential out of the pod's own isolated home, which :func:`secret_path`
     cannot name because it resolves against the CALLING process's data home. The
     name is produced here so the reader and the writer share one spelling.
+
+    Names a PORT, which is a set of listeners rather than one: several addresses
+    can carry the same port number, so a reader that must know WHICH listener it
+    reached wants :func:`listener_secret_file_name` instead.
     """
     return f"{_MARKER_PREFIX}{int(port)}{_SECRET_SUFFIX}"
+
+
+def encode_bind_address(host: str) -> str:
+    """Filename-safe spelling of the bind address *host*.
+
+    ``:`` is legal in an IPv6 literal and illegal in a Windows filename, so it is
+    the one character that has to change. The mapping is injective over IP
+    literals, which draw on hex digits, ``.`` and ``:`` alone, so two different
+    addresses can never collide on one file name -- which is the whole property
+    the caller is buying.
+    """
+    return host.replace(":", "_")
+
+
+def listener_secret_file_name(port: int, host: str) -> str:
+    """File name of the credential for the listener at *host* on *port*.
+
+    A listener is an address AND a port. One port number can carry several
+    listeners at once -- ``KIROCREW_BIND=::1`` binds the v6 loopback and leaves
+    IPv4 ``127.0.0.1:<port>`` free for anything else to take -- so a name keyed
+    by port alone names a SET, and a reader resolving it can be handed the
+    credential of a listener it never spoke to. Keying the name by both makes
+    that unrepresentable: the reader asks for the address it dialled and either
+    gets that listener's credential or nothing.
+    """
+    return f"{_MARKER_PREFIX}{int(port)}-{encode_bind_address(host)}{_SECRET_SUFFIX}"
 
 
 def _start_path_for(path: Path) -> Path:
@@ -253,6 +283,18 @@ def secret_path(port: int) -> Path:
     dir on the ``is_sensitive_path`` floor, and is written ``0600``.
     """
     return _run_dir() / secret_file_name(port)
+
+
+def listener_secret_path(port: int, host: str) -> Path:
+    """Path of the credential for the listener at *host* on *port*.
+
+    Sits beside :func:`secret_path` in the same owner-only ``run/`` dir and is
+    written ``0600`` the same way. The two hold the same value for the same
+    gateway generation and differ only in what their names identify: this one
+    names ONE listener, which is what a client that dialled a specific address
+    needs in order to know the credential belongs to the party it reached.
+    """
+    return _run_dir() / listener_secret_file_name(port, host)
 
 
 def read_secret(port: int) -> str:
@@ -562,25 +604,100 @@ def prune_markers(*, keep_port: int) -> None:
         logger.info("Pruned stale gateway run-marker for port %s", port)
 
 
+def listener_secret_paths(port: int) -> list[Path]:
+    """Every listener-keyed credential recorded for *port*, whatever the address.
+
+    The address is part of the name, so a reader that knows which address it
+    dialled can name its own entry directly. A caller that must act on ALL of
+    them -- cleanup, which knows a generation is gone but not which addresses it
+    bound -- cannot, and enumerating is the only honest answer. Read-only: never
+    creates ``run/``.
+    """
+    try:
+        d = config_dir() / RUN_DIR_NAME
+        if not d.is_dir():
+            return []
+        prefix = f"{_MARKER_PREFIX}{int(port)}-"
+        return sorted(p for p in d.glob(f"{prefix}*{_SECRET_SUFFIX}") if p.is_file())
+    except OSError:
+        return []
+
+
 def clear_marker(port: int) -> None:
-    """Best-effort removal of the run-marker, pid sidecar, start identity and credential.
+    """Best-effort removal of the run-marker, pid sidecar, start identity and credentials.
 
     The start identity goes with the pid it attests: on its own it names nothing,
     and leaving it beside a pid file a later gateway rewrites is exactly the
     stale-token pairing the freshness check exists to refuse.
 
-    The credential goes too: it names a generation that does not own the port,
-    so leaving it behind would let a client authenticate with a value the next
-    owner never had. A crash still leaves all four (nothing runs), which is why
-    every consumer verifies ownership rather than trusting presence.
+    The credentials go too, the port-keyed one and every listener-keyed one: each
+    names a generation that does not own the port, so leaving one behind would let
+    a client authenticate with a value the next owner never had. For a
+    listener-keyed entry there is a second reason -- a client refuses when it
+    finds no entry for the address it dialled, and that refusal is the whole
+    protection against handing a credential to a listener this gateway is not. A
+    surviving entry turns it into a wasted round trip instead. A crash still
+    leaves everything (nothing runs), which is why every consumer verifies
+    ownership rather than trusting presence.
     """
     for path in (
         marker_path(port),
         pid_path(port),
         _start_path_for(pid_path(port)),
         secret_path(port),
+        *listener_secret_paths(port),
     ):
         try:
             path.unlink(missing_ok=True)
         except OSError:
             pass
+
+
+def clear_late_marker_write(port: int) -> bool:
+    """Undo a :func:`write_marker` that landed after shutdown had already cleared.
+
+    Answers True when files were removed, False when the pid record names another
+    process and nothing was touched.
+
+    What separates this from :func:`clear_marker` is WHEN each one runs.
+    ``clear_marker`` runs while the shutting-down gateway still holds its
+    listener, so no other process can have published under these names yet, and
+    clearing by location is therefore clearing its own. This runs from a detached
+    thread at an arbitrary later point, which may be after the listener is free
+    and a replacement gateway has bound the port and published its own state. At
+    that point a location does not identify an owner, so the action is scoped
+    twice, and the two scopes cover different things:
+
+    * Never a credential, whatever the pid record says. This is the
+      unconditional half, and it is the one that matters: the late write this
+      exists to undo creates no credential, so deleting one reaches past the
+      mistake being corrected, and deleting a successor's would answer 403 to
+      every client that had already read it.
+    * Only while the pid record names THIS process, which declines the marker,
+      pid and start identity of a gateway that is not this one. Its reach is
+      narrower than it looks, and the limit is worth stating: a late
+      :func:`write_marker` rewrites that record with this process's own pid, so
+      after a write that landed the answer is True by construction. What the
+      check covers is every path where the write did NOT land -- it is
+      best-effort and swallows its own failures -- plus any caller that reaches
+      here without writing first. It cannot undo a clobber that already
+      happened, and a pid read taken BEFORE the write cannot substitute for it:
+      the successor appears after that read, so the value it returns is this
+      port's previous occupant, not its next one. Keeping a successor's marker
+      intact means guarding the WRITE, which is a change on the gateway boot
+      path rather than here.
+
+    An unreadable pid record answers False for the same reason: an owner that
+    cannot be established is treated as somebody else's.
+    """
+    try:
+        if read_pid(port) != os.getpid():
+            return False
+    except Exception:
+        return False
+    for path in (marker_path(port), pid_path(port), _start_path_for(pid_path(port))):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True

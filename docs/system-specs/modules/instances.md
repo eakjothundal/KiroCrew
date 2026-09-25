@@ -1069,8 +1069,10 @@ segments are trusted module constants.
 `<data-home>/run/gateway-<port>.bin` (the running gateway's own `kirocrew`
 launcher path), `<data-home>/run/gateway-<port>.pid` (its pid) and
 `<data-home>/run/gateway-<port>.start` (that pid's start-time identity, section
-12.2). It has two unrelated consumers, and separating them is the point of the
-module.
+12.2). It also names the two internal-API credential sidecars a serving gateway
+publishes beside those, `<data-home>/run/gateway-<port>.secret` and
+`<data-home>/run/gateway-<port>-<address>.secret` (section 12.1). It has two
+unrelated consumers, and separating them is the point of the module.
 
 ### Consumer 1: remote token mint targets the running gateway's install
 
@@ -1150,13 +1152,35 @@ indistinguishable from the caller. Such a marker still prunes, so markers do not
 accumulate forever -- but the prune removes only the marker and pid sidecar, never
 the credential, because treating False as death would strip a LIVE incumbent's
 credential on every Windows host and push its clients onto a shared file a newcomer
-may have replaced. `clear_marker()` owns credential deletion.
+may have replaced. `clear_marker()` owns credential deletion, and it deletes the
+port-keyed credential together with EVERY address-keyed one for that port. It has
+to enumerate (`run_marker.listener_secret_paths`) because cleanup knows a
+generation is gone but not which addresses it bound. A surviving address-keyed
+entry would be worse than a wasted round trip: the refusal a client performs when
+it finds no entry for the address it dialled is the whole protection, and a stale
+entry silently turns that refusal off. The enumeration is a filesystem scan, so a
+coroutine offloads `clear_marker()` (`asyncio.to_thread`) rather than calling it
+inline; a repo-wide AST test holds that.
 
-### 12.1 The internal-API credential is keyed by port
+### 12.1 The internal-API credential is keyed to one listener
 
 `<data-home>/run/gateway-<port>.secret` holds the internal-API credential of the
-gateway serving that port, written `0600` beside the marker and removed by
-`clear_marker()` with it.
+gateway serving that port, written `0600` beside the marker.
+`<data-home>/run/gateway-<port>-<address>.secret` holds the same credential under
+the address that gateway actually bound, with `:` rewritten to `_` so the name is
+legal on Windows. `clear_marker()` removes both.
+
+**A port names a SET of listeners, not one party.** `KIROCREW_BIND` takes any
+address, so a gateway on `::1:<port>` leaves `127.0.0.1:<port>` unbound and
+seizable -- by an `ssh -L` tunnel's local end, or by a co-resident process -- and a
+credential looked up on the port alone resolves to that other listener's entry.
+The port-keyed file therefore says only "some gateway in this home served this
+port"; the address-keyed file is the one that names the party a client is about to
+dial. A caller that can name its dial address reads the address-keyed entry and
+refuses when it is absent, because an entry that merely shares the port is a
+fail-open wearing a hit's clothing. Callers that resolve a port and nothing finer
+(`config/loader.py`, `mcp_core.py`, `cron_script.py`, the container runtime) still
+read the port-keyed file, which is why it stays published.
 
 The credential is generated per gateway start (`os.urandom(16).hex()`) and kept in
 memory as the value the auth middleware compares against, so it identifies ONE
@@ -1171,11 +1195,21 @@ no warning and no metric.
 
 Two rules keep the two halves paired:
 
-- **The writer** (`dashboard.server._write_instance_credentials`) always writes the
-  per-port file, and writes the shared `.local_secret` only when no other gateway
-  in the home is verifiably alive on a different port. The shared file is still
+- **The writer** (`dashboard.server._write_instance_credentials`) writes the
+  per-port file ALWAYS and FIRST, then the address-keyed file whenever the bound
+  address is known, then the shared `.local_secret` only when no other gateway in
+  the home is verifiably alive on a different port. The shared file is still
   written in the single-instance case because pre-per-port readers (an older CLI,
   a cron script from a previous install) know only that path.
+  The order and the error handling are both load-bearing. `_write_secret_file`
+  raises `OSError` on any failure -- a Windows DACL apply that cannot resolve the
+  invoking SID is one -- and `start_dashboard` answers an `OSError` from
+  publication by tearing the runner down, so the port-keyed credential a booting
+  pod waits on is written before anything that could abort. The address-keyed
+  write is therefore CONTAINED: it logs the file NAME and continues, because its
+  absence costs one explicit sign-in while an `OSError` there would cost the whole
+  gateway. An empty bound address suppresses that write rather than filing the
+  credential under a guessed address.
 - **The reader** is ONE shared helper, `config.loader.read_local_secret(port)`: it
   returns the credential for the port the caller is about to dial and falls back to
   `.local_secret` when no per-port file exists. It lives there rather than in each

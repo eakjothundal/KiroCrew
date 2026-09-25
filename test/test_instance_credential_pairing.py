@@ -73,11 +73,279 @@ class TestPerPortCredentialFile:
         assert run_marker.read_secret(5476) == ""
 
 
+class TestListenerKeyedCredentialFile:
+    """One port number can carry several listeners; the name must separate them.
+
+    ``KIROCREW_BIND=::1`` binds the v6 loopback and leaves IPv4
+    ``127.0.0.1:<port>`` unbound, so a co-resident can hold the address a client
+    dials while this gateway holds the same port number. A name keyed by port
+    alone cannot tell the two apart, and a client resolving it sends this
+    gateway's credential to that co-resident.
+    """
+
+    def test_name_carries_both_the_port_and_the_address(self, home: Path) -> None:
+        assert (
+            run_marker.listener_secret_path(5476, "127.0.0.1").name
+            == "gateway-5476-127.0.0.1.secret"
+        )
+
+    def test_sits_beside_the_marker(self, home: Path) -> None:
+        assert (
+            run_marker.listener_secret_path(5476, "127.0.0.1").parent
+            == run_marker.marker_path(5476).parent
+        )
+
+    def test_two_addresses_on_one_port_are_two_files(self, home: Path) -> None:
+        v4 = run_marker.listener_secret_path(5476, "127.0.0.1")
+        v6 = run_marker.listener_secret_path(5476, "::1")
+        assert v4 != v6
+
+    def test_address_is_spelled_without_a_character_windows_refuses(self, home: Path) -> None:
+        # ":" is legal in an IPv6 literal and illegal in a Windows filename, so
+        # an unencoded name could not be created there at all.
+        assert ":" not in run_marker.listener_secret_file_name(5476, "::1")
+        assert run_marker.encode_bind_address("::1") == "__1"
+        assert run_marker.encode_bind_address("127.0.0.1") == "127.0.0.1"
+
+    def test_encoding_keeps_different_addresses_apart(self, home: Path) -> None:
+        encoded = {
+            run_marker.encode_bind_address(a)
+            for a in ("127.0.0.1", "0.0.0.0", "::1", "::", "fd7a:115c:a1e0::1")
+        }
+        assert len(encoded) == 5
+
+    def test_published_under_the_bound_address(self, home: Path) -> None:
+        shared = home / ".local_secret"
+        with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=None):
+            dashboard_server._write_instance_credentials(shared, 5476, "::1", "v6-secret")
+        assert (
+            run_marker.listener_secret_path(5476, "::1").read_text(encoding="utf-8").strip()
+            == "v6-secret"
+        )
+        # Nothing is filed under an address this gateway never bound, so a client
+        # dialling v4 loopback finds no entry and refuses.
+        assert not run_marker.listener_secret_path(5476, "127.0.0.1").exists()
+
+    def test_absent_address_suppresses_the_listener_entry(self, home: Path) -> None:
+        # An unreadable bind address must not be guessed at: no entry means a
+        # client refuses, which is the safe direction.
+        shared = home / ".local_secret"
+        with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=None):
+            dashboard_server._write_instance_credentials(shared, 5476, "", "mine")
+        assert not run_marker.listener_secret_path(5476, "").exists()
+        assert run_marker.read_secret(5476) == "mine"
+
+    def test_a_failing_listener_write_does_not_abort_the_publication(self, home: Path) -> None:
+        # The credential a booting pod waits on is run/gateway-<port>.secret, and
+        # _write_secret_file raises OSError on any failure -- a Windows DACL apply
+        # that cannot resolve the invoking SID among them. The caller answers an
+        # OSError from this function by tearing the runner down, so an extra
+        # artifact that raises would stop the gateway booting at all. Its absence
+        # costs one explicit sign-in instead.
+        shared = home / ".local_secret"
+        real = dashboard_server._write_secret_file
+        listener = run_marker.listener_secret_path(5476, "127.0.0.1")
+
+        def refuse_the_listener_entry(path: Path, value: str) -> None:
+            if path == listener:
+                raise OSError("DACL apply refused")
+            real(path, value)
+
+        with mock.patch.object(
+            dashboard_server, "_write_secret_file", side_effect=refuse_the_listener_entry
+        ), mock.patch.object(dashboard_server, "_live_sibling_port", return_value=None):
+            dashboard_server._write_instance_credentials(shared, 5476, "127.0.0.1", "mine")
+
+        assert run_marker.read_secret(5476) == "mine"
+        assert shared.read_text().strip() == "mine"
+        assert not listener.exists()
+
+    def test_listener_entry_published_even_while_a_sibling_holds_the_shared_file(
+        self, home: Path
+    ) -> None:
+        # The sibling guard withholds only the shared file. A client dialling this
+        # gateway's own address must still find its entry.
+        shared = home / ".local_secret"
+        shared.write_text("incumbent")
+        with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=5476):
+            dashboard_server._write_instance_credentials(shared, 7811, "127.0.0.1", "newcomer")
+        assert shared.read_text() == "incumbent"
+        assert (
+            run_marker.listener_secret_path(7811, "127.0.0.1").read_text(encoding="utf-8").strip()
+            == "newcomer"
+        )
+
+    def test_written_owner_only(self, home: Path) -> None:
+        dashboard_server._write_secret_file(
+            run_marker.listener_secret_path(7811, "127.0.0.1"), "deadbeef"
+        )
+        path = run_marker.listener_secret_path(7811, "127.0.0.1")
+        assert path.read_text(encoding="utf-8").strip() == "deadbeef"
+        if os.name == "nt":
+            pytest.skip("POSIX mode bits are not honoured on Windows")
+        mode = path.stat().st_mode & 0o777
+        assert mode == 0o600, oct(mode)
+
+    def test_a_graceful_shutdown_leaves_no_listener_entry(self, home: Path) -> None:
+        # A client refuses when it finds no entry for the address it dialled, and
+        # that refusal is the whole protection against handing a credential to a
+        # listener this gateway is not. An entry surviving a clean shutdown turns
+        # the refusal into a wasted round trip against whoever took the port next.
+        run_marker.write_marker(5476)
+        for host in ("127.0.0.1", "0.0.0.0", "::1"):
+            dashboard_server._write_secret_file(
+                run_marker.listener_secret_path(5476, host), "deadbeef"
+            )
+        dashboard_server._write_secret_file(run_marker.secret_path(5476), "deadbeef")
+        assert len(run_marker.listener_secret_paths(5476)) == 3
+
+        run_marker.clear_marker(5476)
+
+        assert run_marker.listener_secret_paths(5476) == []
+        assert run_marker.read_secret(5476) == ""
+
+    def test_cleanup_enumerates_only_this_port(self, home: Path) -> None:
+        # The port is part of the name, so a sibling listener on another port must
+        # survive a cleanup that knows nothing about which addresses it bound.
+        for port in (5476, 7811):
+            dashboard_server._write_secret_file(
+                run_marker.listener_secret_path(port, "127.0.0.1"), f"secret-{port}"
+            )
+        run_marker.clear_marker(5476)
+        assert run_marker.listener_secret_paths(5476) == []
+        assert (
+            run_marker.listener_secret_path(7811, "127.0.0.1").read_text(encoding="utf-8").strip()
+            == "secret-7811"
+        )
+
+    def test_enumeration_creates_nothing(self, home: Path) -> None:
+        assert run_marker.listener_secret_paths(5476) == []
+        assert not (home / "run").exists()
+
+    def test_a_late_self_clear_removes_only_this_generations_own_write(
+        self, home: Path
+    ) -> None:
+        # The late write it undoes creates the marker, the pid and the start
+        # identity, so those go. A credential is not its to delete.
+        run_marker.write_marker(5476)
+        dashboard_server._write_secret_file(
+            run_marker.listener_secret_path(5476, "127.0.0.1"), "mine"
+        )
+        dashboard_server._write_secret_file(run_marker.secret_path(5476), "mine")
+
+        assert run_marker.clear_late_marker_write(5476) is True
+
+        assert not run_marker.marker_path(5476).exists()
+        assert run_marker.read_pid(5476) is None
+        assert run_marker.read_secret(5476) == "mine"
+        assert len(run_marker.listener_secret_paths(5476)) == 1
+
+    def test_a_late_self_clear_leaves_a_successors_state_alone(self, home: Path) -> None:
+        # The race this closes: the marker write stalls past the shutdown wait, so
+        # shutdown flags a clear and frees the listener; a replacement gateway binds
+        # the port and publishes its own marker and credentials; only then does the
+        # detached writer thread finish and try to clear. Scoped to the location it
+        # would delete the successor's credential, and every client that had read it
+        # gets a 403. Scoped to the owner it deletes nothing.
+        successor_pid = os.getpid() + 1
+        run_marker.write_marker(5476)
+        run_marker.pid_path(5476).write_text(f"{successor_pid}\n", encoding="utf-8")
+        for host in ("127.0.0.1", "0.0.0.0"):
+            dashboard_server._write_secret_file(
+                run_marker.listener_secret_path(5476, host), "successor"
+            )
+        dashboard_server._write_secret_file(run_marker.secret_path(5476), "successor")
+
+        assert run_marker.clear_late_marker_write(5476) is False
+
+        assert run_marker.marker_path(5476).exists()
+        assert run_marker.read_pid(5476) == successor_pid
+        assert run_marker.read_secret(5476) == "successor"
+        assert len(run_marker.listener_secret_paths(5476)) == 2
+
+    def test_a_late_self_clear_declines_when_no_owner_can_be_established(
+        self, home: Path
+    ) -> None:
+        # An owner that cannot be read is somebody else's, not nobody's.
+        dashboard_server._write_secret_file(
+            run_marker.listener_secret_path(5476, "127.0.0.1"), "untouched"
+        )
+        assert run_marker.clear_late_marker_write(5476) is False
+        assert len(run_marker.listener_secret_paths(5476)) == 1
+
+    def test_the_gateway_late_clear_is_the_generation_scoped_one(self) -> None:
+        # The shutdown-side clear holds the listener while it runs, so clearing by
+        # location is clearing its own. The detached writer thread has no such
+        # guarantee, so it must call the owner-scoped one. Read from source, so
+        # swapping the call back reddens here.
+        import ast
+        from pathlib import Path as _Path
+
+        src = (
+            _Path(__file__).resolve().parent.parent
+            / "src"
+            / "kiro_crew"
+            / "slack"
+            / "gateway.py"
+        )
+        tree = ast.parse(src.read_text(encoding="utf-8"))
+        worker = [
+            fn
+            for fn in ast.walk(tree)
+            if isinstance(fn, ast.FunctionDef) and fn.name == "_write_marker_worker"
+        ]
+        assert len(worker) == 1, "the late marker writer is named _write_marker_worker"
+        called = {
+            ast.unparse(node.func).rsplit(".", 1)[-1]
+            for node in ast.walk(worker[0])
+            if isinstance(node, ast.Call)
+        }
+        assert "clear_late_marker_write" in called
+        assert "clear_marker" not in called
+
+    def test_no_coroutine_clears_the_marker_on_the_event_loop(self) -> None:
+        """Cleanup walks the run directory, so no coroutine may call it inline.
+
+        ``clear_marker`` unlinks the marker, two pid sidecars and every credential
+        sidecar the listeners published, and finding the last group means globbing
+        and stat-ing ``run/``. A slow or large directory would then stall the loop
+        during shutdown, which is exactly when the graceful path is trying to save
+        active state. Enumerated from source rather than asserted about one call
+        site, so a direct call reintroduced in any coroutine fails here.
+        """
+        import ast
+        from pathlib import Path as _Path
+
+        root = _Path(__file__).resolve().parent.parent / "src" / "kiro_crew"
+        offenders: list[str] = []
+        for py in root.rglob("*.py"):
+            try:
+                tree = ast.parse(py.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError):  # pragma: no cover - unreadable source
+                continue
+            for fn in ast.walk(tree):
+                if not isinstance(fn, ast.AsyncFunctionDef):
+                    continue
+                for node in ast.walk(fn):
+                    if not isinstance(node, ast.Call):
+                        continue
+                    target = ast.unparse(node.func)
+                    if not target.endswith(("clear_marker", "clear_late_marker_write")):
+                        continue
+                    # An offloaded call appears as an ARGUMENT to to_thread or
+                    # run_in_executor, never as the called expression itself.
+                    offenders.append(f"{py.relative_to(root)}:{node.lineno} {target}")
+        assert offenders == [], (
+            "clear_marker is called directly inside a coroutine; offload it with "
+            f"asyncio.to_thread instead: {offenders}"
+        )
+
+
 class TestSharedFileIsNotClobberedWhileASiblingServes:
     def test_shared_file_written_when_this_is_the_only_gateway(self, home: Path) -> None:
         shared = home / ".local_secret"
         with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=None):
-            dashboard_server._write_instance_credentials(shared, 5476, "mine")
+            dashboard_server._write_instance_credentials(shared, 5476, "127.0.0.1", "mine")
         assert shared.read_text() == "mine"
         assert run_marker.read_secret(5476) == "mine"
 
@@ -85,7 +353,7 @@ class TestSharedFileIsNotClobberedWhileASiblingServes:
         shared = home / ".local_secret"
         shared.write_text("incumbent")
         with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=5476):
-            dashboard_server._write_instance_credentials(shared, 7811, "newcomer")
+            dashboard_server._write_instance_credentials(shared, 7811, "127.0.0.1", "newcomer")
         # The incumbent keeps comparing against "incumbent"; clients that resolve
         # its port must keep reading it.
         assert shared.read_text() == "incumbent"
@@ -159,9 +427,9 @@ class TestClientReadsTheCredentialForThePortItDials:
 
         shared = home / ".local_secret"
         with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=None):
-            dashboard_server._write_instance_credentials(shared, 5476, "incumbent")
+            dashboard_server._write_instance_credentials(shared, 5476, "127.0.0.1", "incumbent")
         with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=5476):
-            dashboard_server._write_instance_credentials(shared, 7811, "newcomer")
+            dashboard_server._write_instance_credentials(shared, 7811, "127.0.0.1", "newcomer")
 
         with mock.patch.object(mcp_core, "_api_port", return_value=5476):
             assert mcp_core._internal_secret() == "incumbent"
@@ -277,7 +545,7 @@ class TestEphemeralBindPublishesUnderTheRealPort:
     def test_credential_lands_under_the_assigned_port_not_zero(self, home: Path) -> None:
         shared = home / ".local_secret"
         with mock.patch.object(dashboard_server, "_live_sibling_port", return_value=5476):
-            dashboard_server._write_instance_credentials(shared, 41234, "ephemeral")
+            dashboard_server._write_instance_credentials(shared, 41234, "127.0.0.1", "ephemeral")
         assert run_marker.read_secret(41234) == "ephemeral"
         assert run_marker.read_secret(0) == ""
 
