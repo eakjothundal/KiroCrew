@@ -1,12 +1,12 @@
-import { memo, useState, useMemo, useEffect, useLayoutEffect, useRef, useCallback } from 'react'
+import { Fragment, memo, useState, useMemo, useEffect, useRef } from 'react'
 import { Copy, Check, Columns2, Rows2 } from 'lucide-react'
 import { copyToClipboard } from '../utils/clipboard'
 import { fileReadUrl } from '../utils/fileReadUrl'
 import { isSafePath } from '../utils/safePath'
-import { basenamePatchHeaders } from '../utils/diffUtils'
+import { splitPatchSections, type PatchSection } from '../utils/diffLineCounts'
 import { PierrePatch } from '../pierre'
-import { PlainCodeFallback } from '../pierre/PlainCodeFallback'
-import { PIERRE_COMPACT_HEADER_CSS, PIERRE_WRAP_NO_HSCROLL_CSS, PIERRE_SEPARATOR_BG_CSS } from '../pierre/config'
+import { PlainCodeFallback, PlainFilePairHeader, PlainPatchBodyContext, type PlainPatchBodyOwner } from '../pierre/PlainCodeFallback'
+import { PIERRE_WRAP_NO_HSCROLL_CSS, PIERRE_SEPARATOR_BG_CSS } from '../pierre/config'
 import { HOVER_NONE_ACTIONS_ROW_CLS } from '../utils/touchActions'
 import { useDiffSplit } from '../hooks/useDiffSplit'
 import { usePlainDiff } from '../hooks/usePlainDiff'
@@ -93,15 +93,29 @@ export function extractFilePath(code: string): { path: string; prefixStripped: b
  * path, making "relative spelling absent" meaningless as evidence. */
 const ROOTLESS_ABS_RE = /^(home|Users|tmp|var|opt|workplace)\//
 
-/** Mounts inside Pierre's header-metadata slot, so its mount IS Pierre drawing
- *  its own header: `PierrePatchImpl` calls `renderHeaderMetadata` only when it
- *  renders `FileDiff`, never from its plain fallbacks (chunk still loading,
- *  worker pool unavailable, unparseable patch). A layout effect, not a passive
- *  one, so the caller's state flip commits before the browser paints and the
- *  stand-in header leaves in the same frame Pierre's header arrives. */
-function PierreHeaderSentinel({ onMount }: { onMount: () => void }) {
-  useLayoutEffect(() => { onMount() }, [onMount])
-  return null
+const basename = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+
+/** What a file's header row is titled: the basename, and for a rename the old
+ *  basename, an arrow, the new one. The full path is the wrapper's tooltip and
+ *  the Open button's target; the row only has to tell the files of one patch
+ *  apart. A rename that keeps its basename reads as the basename alone:
+ *  `a.ts → a.ts` would say nothing. */
+function sectionTitle(section: PatchSection, fallbackPath: string | null): string {
+  const name = section.name ?? fallbackPath
+  if (name == null) return ''
+  const prev = section.prevName == null ? null : basename(section.prevName)
+  return prev != null && prev !== basename(name) ? `${prev} → ${basename(name)}` : basename(name)
+}
+
+/** A file's mode change, stated on its row — `mode 100644 → 100755` — because
+ *  it is metadata no body shows: Pierre draws content only, and the plain body
+ *  under the row prints the hunks. Beside an edit or alone, in every state. */
+function modeNote(change: { from: string; to: string }) {
+  return (
+    <span data-mode-change className="shrink-0 text-[11px] font-normal text-muted">
+      {i18nT('components.diffBlock.mode_change', { from: change.from, to: change.to })}
+    </span>
+  )
 }
 
 export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint }: { code: string; complete: boolean; onFileOpen?: (path: string) => void; pathHint?: string }) {
@@ -112,25 +126,22 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint }:
   // seeds the next block, instead of every fence resetting to unified.
   const [sideBySide, setSideBySide] = useDiffSplit()
   // Plain-diff preference (Settings → Display). PierrePatch honours it on its
-  // own; this block reads it too because the controls below are injected into
-  // PIERRE's file header, which the plain render does not draw — so without a
-  // header of our own here, turning colour off would also take Open/Copy away.
+  // own; this block reads it too because the split/unified toggle below is a
+  // Pierre layout option, meaningless over the raw text plain mode prints.
   const [plain] = usePlainDiff()
   // Resolve the file path: prefer headers inside the diff, fall back to the
   // pathHint extracted from the surrounding chat text by MarkdownRenderer
   // (helps when a tool emits "Created /path/to/file:" before a
   // bare diff with no +++/--- headers).
   const extracted = useMemo(() => extractFilePath(code), [code])
-  // The header shows the basename only; `extracted` above keeps the full path
-  // for the Open button, so shortening the copy Pierre parses costs nothing.
-  // Only in HIGHLIGHTED mode, though: there the `--- `/`+++ ` lines are consumed
-  // by Pierre to draw that header and never shown as text, so rewriting them is
-  // invisible. The plain render prints the patch verbatim, so the same rewrite
-  // would put a basename where the reader expects the original path — the one
-  // thing "show me the raw diff" promises not to do, and wrong in what gets
-  // copied out. So plain mode renders `code` untouched; its stand-in header
-  // below does its own basename shortening on `headerPath` instead.
-  const displayPatch = useMemo(() => basenamePatchHeaders(code), [code])
+  // The header row shows the basename only; `extracted` above keeps the full
+  // path for the Open button. The patch itself is handed on untouched: Pierre
+  // consumes its `--- `/`+++ ` lines to name the file for its grammar and
+  // cache key and draws no header here, the plain-mode and streaming renders
+  // print them verbatim — the one thing "show me the raw diff" promises, and
+  // what the Copy button hands out — and only the plain text Pierre shows
+  // INSTEAD of the diff (pool down, unparseable) drops them, because this
+  // row already states what they say (see `PlainPatchBodyContext`).
   const headerPath = extracted?.path ?? pathHint ?? null
   // When a git prefix was stripped and the remainder starts with a
   // conventional root (`home/…`, `tmp/…`, …), the header is ambiguous between
@@ -185,28 +196,29 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint }:
 
   // Diff layout follows the shared, persisted split preference (toggled from
   // this block's own header); wrap because chat/side-panel columns are
-  // width-constrained. Pierre's own file header is the block's title row
-  // (file icon, name, +/- counts).
+  // width-constrained. Pierre draws the BODY only: the block's title row (name,
+  // ± counts, controls) is the header row rendered below, so Pierre's own file
+  // header stays off.
   const options = useMemo(
     () => ({
       diffStyle: (sideBySide ? 'split' : 'unified') as 'split' | 'unified',
       overflow: 'wrap' as const,
-      disableFileHeader: false,
+      disableFileHeader: true,
       // A chat diff is a snippet, not a review surface: `simple` is a bare
       // hairline with no label and no expand control, which keeps a short block
       // reading as continuous code. Every other surface keeps `line-info`, whose
       // count and arrows earn their room on a full file. It also keeps the
       // library's untranslated "N unmodified lines" out of chat entirely.
       hunkSeparators: 'simple' as const,
-      unsafeCSS: PIERRE_COMPACT_HEADER_CSS + PIERRE_WRAP_NO_HSCROLL_CSS + PIERRE_SEPARATOR_BG_CSS,
+      unsafeCSS: PIERRE_WRAP_NO_HSCROLL_CSS + PIERRE_SEPARATOR_BG_CSS,
     }),
     [sideBySide],
   )
 
   const copy = async () => { if (await copyToClipboard(code)) { setCopied(true); setTimeout(() => setCopied(false), 1500) } }
 
-  // Patch-level controls, slotted into Pierre's header metadata area (light
-  // DOM, so outer-tree styling and the group-hover reveal both apply).
+  // Patch-level controls, in the block's own header row (light DOM, so
+  // outer-tree styling and the group-hover reveal both apply).
   // Space for the Open affordance is reserved on exactly the condition that runs
   // the probe, so the probe's OUTCOME never changes this row's geometry.
   //
@@ -231,29 +243,30 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint }:
   // away the moment the next chunk lands. `CodeBlock` already gates its Pierre
   // mount on `complete` for exactly this reason; this is the diff half of that
   // rule. The stand-in is `PlainCodeFallback`, whose body metrics match
-  // Pierre's; the header band is held separately, below.
+  // Pierre's; the header row above it is the block's own and does not change.
   const standInForStream = !complete
-  // The stand-in header outlives the stream: it stays until Pierre has drawn
-  // its own header, so the 32px band never leaves the layout mid-read. A cold
-  // `PierrePatch` shows a HEADER-LESS plain fallback until its impl paints --
-  // Pierre was never mounted while streaming, so WarmSwap has no cached height
-  // to floor the box with -- and dropping the stand-in at the flip would lift
-  // the patch body by the header's height, then drop it back when Pierre's
-  // header lands. Two signals, both required: WarmSwap's reveal (its box is
-  // `visibility:hidden` until then, so Pierre's header is not on screen even
-  // once drawn) and the sentinel's mount (WarmSwap reveals as soon as its box
-  // has ANY height, which is before a still-loading chunk or an unavailable
-  // worker pool has drawn a header at all). Scoped to a block that streamed in
-  // THIS mount: a block complete from its first render never showed a stand-in
-  // header, and a virtualized remount of one is floored by WarmSwap at the
-  // height Pierre painted last time -- adding a band above that box would make
-  // the reserved height wrong by exactly the band.
-  const [streamedHere] = useState(standInForStream)
-  const [pierreRevealed, setPierreRevealed] = useState(false)
-  const [pierreHeaderMounted, setPierreHeaderMounted] = useState(false)
-  const onPierreVisible = useCallback(() => setPierreRevealed(true), [])
-  const onPierreHeaderMount = useCallback(() => setPierreHeaderMounted(true), [])
-  const holdStandInHeader = standInForStream || (streamedHere && !(pierreRevealed && pierreHeaderMounted))
+  // The patch, one section per file it carries, each with the file it names and
+  // its own ± counts — the same rows Pierre's own headers would draw, one per
+  // file, available in every state: while frames arrive, while the highlight
+  // pool is starting or recovering, in plain mode — because the block owns
+  // them. A single-file patch is one section.
+  const sections = useMemo(() => splitPatchSections(code), [code])
+  // Whether Pierre is showing plain text INSTEAD of the diff under any of the
+  // rows — its highlight pool down, or a section it cannot parse. Pierre's
+  // patch surface reports each such body through `PlainPatchBodyContext` as it
+  // mounts and leaves (a count, because a multi-file patch has one body per
+  // row), so the block knows the state from the body itself rather than by
+  // reading Pierre's internals. While it holds: the first row says "Plain
+  // view", the body prints the hunks' content only (the row already names the
+  // file and counts its lines), and the split/unified toggle — a Pierre
+  // layout option, meaningless over plain text — is disabled and says why.
+  // A hold before the diff paints does not report: the toggle it would gate
+  // still shapes the diff that is about to land.
+  const [plainBodies, setPlainBodies] = useState(0)
+  const plainBodyOwner = useMemo<PlainPatchBodyOwner>(() => ({
+    onPlainBody: mounted => setPlainBodies(n => n + (mounted ? 1 : -1)),
+  }), [])
+  const plainBody = plainBodies > 0
 
   const headerControls = () => (
     <span className={`relative z-10 flex items-center gap-1 opacity-0 group-hover/diff:opacity-100 group-focus-within/diff:opacity-100 transition-opacity ${HOVER_NONE_ACTIONS_ROW_CLS}`}>
@@ -271,57 +284,68 @@ export default memo(function DiffBlock({ code, complete, onFileOpen, pathHint }:
         </button>
       )}
       {/* Split/unified is a PIERRE layout option, so omit it while plain mode
-          or the stand-in renders the raw patch. It also keeps the stand-in
-          header at two actions (`max-two-buttons-per-row`); Pierre's own
-          header, the only row that ever shows it, is where it belongs. */}
-      {!plain && !holdStandInHeader && (
-        <button className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer" onClick={() => setSideBySide(!sideBySide)} title={sideBySide ? i18nT('components.diffBlock.unified_view') : i18nT('components.diffBlock.split_view')} aria-label={sideBySide ? i18nT('components.diffBlock.switch_to_unified_view') : i18nT('components.diffBlock.switch_to_split_view')}>{sideBySide ? <Rows2 size={13} /> : <Columns2 size={13} />}</button>
+          or the streaming stand-in renders the raw patch: over raw text the
+          toggle would change nothing the reader can see. It also keeps the
+          streaming row at two actions (`max-two-buttons-per-row`). While
+          Pierre itself shows plain text (pool down, unparseable section) the
+          button stays — so the row's geometry does not change under the
+          reader — but disabled, and says why. */}
+      {!plain && !standInForStream && (
+        <button
+          className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted"
+          onClick={() => setSideBySide(!sideBySide)}
+          disabled={plainBody}
+          title={plainBody ? i18nT('components.diffBlock.layout_unavailable_in_plain_view') : sideBySide ? i18nT('components.diffBlock.unified_view') : i18nT('components.diffBlock.split_view')}
+          aria-label={plainBody ? i18nT('components.diffBlock.layout_unavailable_in_plain_view') : sideBySide ? i18nT('components.diffBlock.switch_to_unified_view') : i18nT('components.diffBlock.switch_to_split_view')}
+        >
+          {sideBySide ? <Rows2 size={13} /> : <Columns2 size={13} />}
+        </button>
       )}
       <button className="p-1 rounded text-muted hover:text-text hover:bg-bg-hover cursor-pointer" onClick={copy} title={copied ? i18nT('components.diffBlock.copied') : i18nT('components.diffBlock.copy_patch')} aria-label={copied ? i18nT('components.diffBlock.copied') : i18nT('components.diffBlock.copy_patch')}>{copied ? <Check size={13} /> : <Copy size={13} />}</button>
     </span>
   )
 
-  // Pierre's header hosts the controls only once the stand-in header is gone,
-  // so exactly one visible header carries them at any time. The sentinel is
-  // what reports that Pierre's header exists at all.
-  const pierreHeaderMetadata = () => (
-    <>
-      {!holdStandInHeader && headerControls()}
-      <PierreHeaderSentinel onMount={onPierreHeaderMount} />
-    </>
-  )
-
   return (
     /* The header shows the basename, so two changed files sharing a name render
-       as identical blocks; the full path lives here as a tooltip. It sits on the
-       wrapper because Pierre paints the title inside its shadow root — a native
-       `title` resolves up the flat tree, so hovering the filename picks it up. */
+       as identical blocks; the full path lives here as a tooltip. */
     <div className="diff-block group/diff rounded-xl border border-border overflow-hidden" title={headerPath ?? undefined}>
       <div className="relative pierre-surface">
-        {/* Plain mode, and a streamed block until Pierre's header is on
-            screen: Pierre's file header is what normally carries the filename
-            and hosts `headerControls`, so a header of our own stands in for it
-            — otherwise turning colour off would silently remove Open/Copy and
-            the filename too, and a finishing stream would drop them mid-read.
-            `min-h-8`, not `h-8`: `headerControls` grows its buttons to 40px on a
-            touch device (`HOVER_NONE_ACTIONS_ROW_CLS` pads them for thumbs), and
-            a fixed 32px band would clip the top of them against `.diff-block`'s
-            `overflow-hidden` and push the rest over the patch body. Pierre's own
-            header band — the thing this stands in for — is `min-height` for the
-            same reason. */}
-        {(plain || holdStandInHeader) && (
-          <div className={`flex items-center justify-between gap-2 min-h-8 pr-2 border-b border-border text-[12px] text-muted pl-3`}>
-            <span className="truncate font-mono">{headerPath ? headerPath.split('/').pop() : ''}</span>
-            {headerControls()}
-          </div>
-        )}
-        {/* `code`, never `displayPatch`, on the plain path: the basename rewrite
-            is invisible only where Pierre CONSUMES the `--- `/`+++ ` lines to
-            draw its header. Printed as text it would hand the reader (and the
-            Copy button) a patch whose paths no longer apply. */}
-        {standInForStream
-          ? <PlainCodeFallback text={code} />
-          : <PierrePatch patch={plain ? code : displayPatch} options={options} renderHeaderMetadata={pierreHeaderMetadata} onVisible={onPierreVisible} />}
+        {/* One title row per file, drawn by the block for the block's whole
+            life: filename, ± counts, and — on the first row, where Pierre's
+            first header carried them — `headerControls`, which act on the
+            whole patch. Pierre draws each file's body only. Pierre's own
+            header exists only while its renderer holds a highlight result —
+            not while its chunk loads, not while the worker pool is starting or
+            recovering after a failure, not for a patch that will not parse,
+            never in plain mode — so a control slotted into it is gone in every
+            one of those states, and a mount of the slot proves nothing about
+            the shadow header it projects into. One header per file in every
+            state, by construction rather than by detection. The row is the one
+            the oversized file-pair card keeps for the same reason, so the two
+            read alike. Each section is a one-file patch, so Pierre and the
+            streaming stand-in take it as they would the whole. */}
+        {sections.map((section, i) => (
+          <Fragment key={`${section.name ?? ''}:${i}`}>
+            <PlainFilePairHeader
+              filename={sectionTitle(section, i === 0 ? headerPath : null)}
+              label={i === 0 && plainBody ? i18nT('components.diffBlock.plain_view') : undefined}
+              stats={section}
+              renderHeaderFilenameSuffix={section.modeChange ? () => modeNote(section.modeChange!) : undefined}
+              renderHeaderActions={i === 0 ? headerControls : undefined}
+            />
+            {standInForStream
+              ? <PlainCodeFallback text={section.text} />
+              : (
+                /* No owner in plain-diff mode: the reader asked for the raw
+                   patch and gets it verbatim. With colour on, every plain body
+                   under the row — the hold and Pierre's stand-in for the diff —
+                   takes the hunks-only shape, and only the stand-in reports. */
+                <PlainPatchBodyContext.Provider value={plain ? null : plainBodyOwner}>
+                  <PierrePatch patch={section.text} options={options} />
+                </PlainPatchBodyContext.Provider>
+              )}
+          </Fragment>
+        ))}
         {!complete && <div className="px-3 py-1 text-muted text-[12px] italic animate-pulse">{i18nT('components.diffBlock.generating_diff')}</div>}
       </div>
     </div>

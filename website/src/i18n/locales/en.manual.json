@@ -2058,7 +2058,10 @@
     "diffBlock": {
       "copied": "Copied!",
       "copy_patch": "Copy patch",
+      "layout_unavailable_in_plain_view": "Unavailable in plain view",
+      "mode_change": "mode {{from}} → {{to}}",
       "open_in_side_panel": "Open {{path}} in side panel",
+      "plain_view": "Plain view",
       "split_view": "Split view",
       "switch_to_split_view": "Switch to split view",
       "switch_to_unified_view": "Switch to unified view",
