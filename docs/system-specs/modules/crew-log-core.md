@@ -344,12 +344,21 @@ same slot was writing before. Same citation shape as `parent`, written once at c
 rewritten, absent rather than empty when there is nothing to name -- the slot's first crew log, a
 predecessor the gateway could not name, and one whose own header does not name this slot are all
 "nothing to follow". No `slot` is repeated inside it,
-because it is the slot in `data.slot`. The id is the slot's own newest unit in the store --
-the unit no other unit of that slot cites as `previous`. The store is the authority because
-it is the only source that outlives the gateway process that wrote it, and it cannot
-disagree with the units because it IS the units. The persisted slot-to-session mapping,
-read without pruning, is the fallback for a slot with no unit yet -- its first crew log, or
-a launch with the crew log off. It cannot be the authority: an allocation whose replay is still
+because it is the slot in `data.slot`. The id is resolved in three tiers. The store this slot
+last handed to a `session/opened`, recorded on the slot as that entry's edge is spent, is
+first: the create is queued to a writer thread, so it is the only source that can name a crew
+log whose unit is not on disk yet. The slot's own newest unit IN THE STORE -- the unit no other
+unit of that slot cites as `previous` -- is next, and it is the durable one: the record above
+dies with its process, and this does not. It answers UNDECIDED when the units cannot be listed
+or read, or do not say which is newest, and no edge is written then -- but the entry does record
+`previous_undecided`, because a log that merely omits `previous` reads as the slot's FIRST log
+and a later fold would pass over it and elect the log before it. The persisted
+slot-to-session mapping,
+read without pruning, is last, for a slot the store says has no unit at all -- which includes a
+store that is not at the name, the ordinary launch of a crew log switched off, and a slot whose
+units all predate this edge and so record no succession to read. It cannot be
+higher, and inside the replay-pending window it is not read at all: an allocation whose
+replay is still
 pending holds the prior resumable id in the mapping on purpose, so that a restart can still
 resume it, and the mapping is then a generation
 behind -- two successive crew logs would cite one predecessor

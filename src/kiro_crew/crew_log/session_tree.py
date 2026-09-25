@@ -87,6 +87,7 @@ from itertools import islice
 from pathlib import Path
 from typing import Any, Final
 
+from kiro_crew.crew_log.errors import CrewLogError
 from kiro_crew.crew_log.schema import KIND_SESSION, Entry
 from kiro_crew.crew_log.store import (
     find_last_tree_edge,
@@ -179,6 +180,17 @@ class OpenedRecord:
     The two citations are on different axes and neither implies the other: a slot
     that nobody created still supersedes its own earlier logs, and a slot's first
     log still names its creator.
+
+    ``previous_known`` is what makes that distinctness usable, because ``None``
+    alone carries two meanings and a fold has to tell them apart. It is true only
+    when the ``session/opened`` announce was READ and recorded a definite answer, so
+    an absent ``previous`` is a recorded fact: this log states it has no predecessor.
+    It is false in the two cases where the absence is a GAP -- the announce was not
+    read at all (retention took the creating segment, a process died between create
+    and announce, the log is admitted on its header alone), or the announce carries a
+    ``previous`` that names nothing, which is the writer saying a predecessor exists
+    that it could not determine. Ranking treats the two oppositely: a stated absence
+    can be passed over, a gap cannot.
     """
 
     sid: str
@@ -186,6 +198,7 @@ class OpenedRecord:
     created_at: int
     parent_slot: str | None = None
     previous_sid: str | None = None
+    previous_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -659,50 +672,111 @@ def fold_slot_chain(records: Iterable[OpenedRecord], head_sid: str) -> SlotChain
         cursor = step
 
 
-def fold_slot_head(records: Iterable[OpenedRecord], slot: str) -> str:
+@dataclass(frozen=True)
+class SlotHead:
+    """Which log a slot is on, and whether the record could say at all.
+
+    Three answers, and a caller must tell the last two apart. ``sid`` names the log
+    when the record decides. ``sid`` empty with ``decided`` true is a slot with NO
+    log -- a definite fact, and the case where a caller may reach for another source.
+    ``decided`` false is "this record cannot say": a unit that would not read, more
+    than one uncited log, a cycle. That is not the same as "no log", and a caller that
+    treats it as one reaches for a source this record was preferred over.
+    """
+
+    sid: str
+    decided: bool
+
+
+#: A slot with no log at all. Definite: the units were read and none belongs to it.
+NO_LOG: Final[SlotHead] = SlotHead(sid="", decided=True)
+#: The record cannot say which log the slot is on. Never a licence to guess.
+UNDECIDED: Final[SlotHead] = SlotHead(sid="", decided=False)
+
+
+def fold_slot_head(records: Iterable[OpenedRecord], slot: str) -> SlotHead:
     """*slot*'s NEWEST log among *records* -- the head :func:`fold_slot_chain` walks
     from. Pure.
 
     The walk above is handed its head; this is where that head comes from when the
-    caller has only the slot. The edges answer it: a log another log of this slot
-    cites as ``previous`` has a successor, so the newest is the log nothing cites.
+    caller has only the slot. The edges answer it, and ONLY the edges: a log another
+    log of this slot cites as ``previous`` has a successor, so the newest is the log
+    nothing cites. Exactly one such log is the answer.
 
-    Order comes from the edges, never from a timestamp, and that holds here for the
-    reason it holds for the walk: a backward clock step across a restart gives the
-    newer log the earlier stamp, and the citation inverts in neither case. So a
-    single uncited log IS the answer and the stamp is not consulted at all.
+    No timestamp takes part, for the reason the walk admits none: ``created_at`` is
+    wall clock, so a backward step across a restart gives the newer log the earlier
+    stamp. Using it to pick between SEVERAL uncited logs would choose the older one
+    exactly when the clock stepped back, and the choice is written into an
+    append-only ``previous`` -- a permanent wrong citation bought to avoid an honest
+    :data:`UNDECIDED`. Succession DEPTH cannot stand in either: it orders logs inside
+    ONE chain, so a freshly created log with no edge yet (depth 0) would lose to the
+    head of a long chain (depth 5) although it is the newer store by every other
+    reading.
 
-    The stamp decides only between SEVERAL uncited logs, where the edges have
-    nothing left to say -- and each way that happens is a record that is already
-    incomplete: a log whose own announce has not landed or could not be read, one
-    whose edge was never recorded, one whose predecessor retention has removed.
-    Comparing their succession DEPTHS instead would be worse than the clock, not
-    better: depth orders logs inside one chain, so a freshly created log with no
-    edge yet (depth 0) would lose to the head of a long chain (depth 5) even though
-    it is the newer store by every other reading. ``created_at`` then ``sid``, so
-    one input set has one answer whatever order it arrived in.
+    Several uncited logs are a record that cannot simply be read off, and what the
+    answer is depends on WHY the record is short. A cycle leaves no uncited log at
+    all and answers :data:`UNDECIDED`; only a forged or damaged record produces one.
+
+    An uncited log whose predecessor is unknown -- its announce was never read, or it
+    records one it could not determine -- settles the answer to ``UNDECIDED`` once
+    there is anything to choose BETWEEN. Its edge is a gap rather than a statement,
+    so it can neither be ranked nor passed over, and passing over it is exactly what
+    would orphan a store the slot has certainly opened, which is the defect this fold
+    exists to avoid. A slot holding just ONE uncited log needs no ranking at all and
+    answers it, gap or not: there is no other candidate to prefer over it.
+
+    Otherwise every candidate read its announce, so an absent edge is a RECORDED fact:
+    that log states it has no predecessor. Those need no ranking against each other,
+    because what ranks is the edges. Exactly one candidate with an edge is the answer;
+    several are ``UNDECIDED`` -- two genuine chain starts, which no clock may separate.
+
+    None of them carrying an edge is :data:`NO_LOG`, not ``UNDECIDED``, and this is
+    the case a store written before the edge existed is in. Nothing about it is
+    undecidable: the store simply holds no succession for this slot, so the caller's
+    next source answers, and the edge that next create writes is the first thing a
+    later read can rank by -- which is how such a store starts describing itself with
+    no backfill. ``UNDECIDED`` here would be PERMANENT instead of transient: no edge
+    would ever be written, every create would add one more unrankable log, and the
+    next source would stay suppressed for the life of the slot.
 
     Records of other slots take no part: succession is a relation inside ONE slot,
     and letting a foreign log either rank or CITE here would hand this slot's answer
     to another slot's writer -- the refusal :func:`_chain_step` makes for the same
-    reason. ``""`` when no record names *slot*, which is a slot with no log rather
-    than a slot whose newest log could not be decided: there is nothing to cite
-    either way.
+    reason. :data:`NO_LOG` when no record names *slot*, which is a slot with no log
+    and is a different answer from one whose newest log could not be decided.
     """
     mine = [record for record in records if record.slot == slot and record.sid]
     if not mine:
-        return ""
+        return NO_LOG
     cited = {record.previous_sid for record in mine if record.previous_sid}
-    heads = [record for record in mine if record.sid not in cited] or mine
-    # ``or mine``: every log cited by another is only reachable through a cycle, which
-    # takes a forged or damaged record. There is no head to find then, and answering
-    # nothing would drop the edge for a slot whose logs are all real -- so the stamp
-    # places them, the same fallback the ordinary tie uses.
-    return max(heads, key=lambda record: (record.created_at, record.sid)).sid
+    heads = [record for record in mine if record.sid not in cited]
+    if len(heads) == 1:
+        return SlotHead(sid=heads[0].sid, decided=True)
+    if not heads or any(not record.previous_known for record in heads):
+        # No uncited log is a cycle. An uncited log whose announce was never read is
+        # a store this slot certainly opened whose edge is merely unknown -- it can
+        # neither be ranked nor passed over, because passing over it is what orphans
+        # it, so its presence alone settles the answer.
+        return UNDECIDED
+    # Every remaining candidate READ its announce, so an absent edge is a recorded
+    # fact rather than a gap: the log states it has no predecessor. Those cannot be
+    # ranked against each other and do not need to be -- what ranks is the edges.
+    linked = [record for record in heads if record.previous_sid]
+    if len(linked) == 1:
+        return SlotHead(sid=linked[0].sid, decided=True)
+    if linked:
+        return UNDECIDED
+    # None of them records an edge at all, so the store holds no succession for this
+    # slot to read. Nothing here is undecidable, so this is NO_LOG and the caller's
+    # next source answers -- which is also how such a store starts describing itself,
+    # since the edge the next create writes is the first thing a later read can rank
+    # by. Answering UNDECIDED instead would be permanent: no edge would ever be
+    # written, and every create would add one more unrankable log.
+    return NO_LOG
 
 
-def slot_chain_head(slot: str) -> str:
-    """*slot*'s newest crew log, read from the units on disk. ``""`` when it has none.
+def slot_chain_head(slot: str) -> SlotHead:
+    """*slot*'s newest crew log, read from the units on disk.
 
     The durable answer to "which store is this slot writing". Every input is inside
     the fenced crew log tree: the units are the ones whose own header names *slot*,
@@ -715,49 +789,94 @@ def slot_chain_head(slot: str) -> str:
     this slot, which is a handful of small reads for a slot that has superseded a
     handful of times. A coroutine hops a thread for it.
 
-    A unit the listing proved but whose own record cannot be built contributes its
-    IDENTITY without edges, and the distinction matters in both directions. The
-    ordinary case is a create whose ``session/opened`` has not landed yet: the
-    creating job writes the header first and appends the announce second, so a read
-    between the two finds a store this slot has certainly opened and an edge that is
-    merely not written yet. Leaving it out would answer the store before it and
-    orphan it, which is the defect this function exists to remove. Admitting it with
-    no edge is what the record supports -- it ranks as a chain start, and the stamp
-    then places it, which is the one case ``created_at`` is for.
+    ONE unit it cannot read answers :data:`UNDECIDED`, never a head folded from the
+    rest, and the three answers of :class:`SlotHead` exist so a caller cannot confuse
+    that with :data:`NO_LOG`. A transient ``OSError`` here is ordinary operation, not
+    an exotic combination -- a file-descriptor ceiling, a networked data home,
+    retention removing a unit between the listing and the open -- and the id this
+    returns is latched once into an append-only ``previous``. So a head taken from a
+    short record set is a WRONG citation with no second chance, and "no log at all"
+    would send the caller to a source this read was preferred over.
+
+    That applies to the LISTING as much as to the reads below it, which is why it is
+    taken strictly: a unit whose header cannot be proved while it already holds
+    entries is dropped from an ordinary listing without a word, and the unit most
+    likely to be in that state is the newest one -- exactly the one being looked for.
+
+    One strict refusal is NOT a failed read and is answered ``NO_LOG``: the store is
+    not at the name at all. Nothing can be held by a directory that is not there, so
+    "no unit" is complete rather than short -- and that is the ordinary launch, a
+    crew log switched off or one whose first unit has yet to be created. Refusing it
+    would make the mapping, the only source such a launch has, unreachable for every
+    slot for good.
+
+    ``UNDECIDED`` is not sticky. Nothing here remembers a refusal: the listing
+    re-checks a child it could not prove on every call
+    (:func:`~kiro_crew.crew_log.store.session_units_by_slot`), so the read answers
+    again as soon as the bytes do. What does not come back is a citation the emitter
+    skipped while the fault lasted -- that entry is already written -- so this is a
+    recoverable non-answer standing in for an unrecoverable wrong one.
+
+    A unit the listing proved but whose own record cannot be BUILT is different, and
+    is admitted with its identity and no edges. The ordinary case is a create whose
+    ``session/opened`` has not landed yet: the creating job writes the header first
+    and appends the announce second, so a read between the two finds a store this
+    slot has certainly opened and an edge that is merely not written yet. It then
+    makes a second uncited log, so this answers ``UNDECIDED`` rather than guessing --
+    and in that window the slot's OWN record names the store, which is why that
+    record is consulted before this read rather than replaced by it.
     """
     if not slot:
-        return ""
+        return NO_LOG
+    try:
+        units = session_units_for_slot(slot, strict=True)
+    except FileNotFoundError:
+        # No store AT THE NAME, so no unit of this slot can exist and "none" is a
+        # complete answer rather than a read that failed. It has to stay separable
+        # from the refusal below: a crew log that is off, or one whose first unit has
+        # not been created yet, is an ordinary launch, and answering UNDECIDED there
+        # would leave the mapping -- the only source such a launch has -- permanently
+        # unreachable for every slot.
+        return NO_LOG
+    except (CrewLogError, OSError):
+        # STRICT, because the ordinary listing is a READ and answers the shorter
+        # truth: a unit whose header cannot be proved while it already holds entries
+        # is left out silently, and the unit most likely to be in that state is the
+        # newest one. Dropped, it makes the unit before it look uncited, and that
+        # older head is then frozen into an append-only ``previous`` with nothing to
+        # correct it. A failed read must not become a value: strict refuses instead,
+        # and the refusal is what UNDECIDED is for.
+        return UNDECIDED
     records: list[OpenedRecord] = []
-    for unit in session_units_for_slot(slot):
+    for unit in units:
         if not _bounded(unit, MAX_ACP_SESSION_ID_LEN):
-            # A unit id longer than any the gateway writes. Refused rather than
-            # truncated, for the reason `opened_record` refuses one: a shortened id
-            # is a different name, and citing it would point at no store or at
-            # another one.
-            continue
+            # A unit id longer than any the gateway writes. Not skippable: it is a
+            # unit of this slot that this reader cannot account for, and a shortened
+            # id is a different name rather than a usable one.
+            return UNDECIDED
         directory = unit_dir_for(KIND_SESSION, unit)
         if directory is None:
-            continue
+            return UNDECIDED
         segment = oldest_segment(directory)
         if segment is None:
-            continue
+            return UNDECIDED
         try:
             header, entry, _announced = read_head(segment)
         except OSError:
-            # The bytes were not seen. A moment's fault, or retention taking the
-            # unit between the listing and this open -- neither is evidence about
-            # which store the slot is on, so this unit says nothing rather than
-            # being ranked on a header nobody read.
-            continue
+            # The bytes were not seen -- a moment's fault, or retention taking the
+            # unit between the listing and this open. Either way this reader cannot
+            # say which store the slot is on, and saying it anyway from the units it
+            # did read is the wrong citation described above.
+            return UNDECIDED
         if header is None:
-            continue
+            return UNDECIDED
         record = opened_record(directory, header, entry)
         if record is None:
             # Identity without edges. The listing already proved this header's own
             # id folds back to its directory and that it names this slot, so the
             # store exists and belongs here; what is missing is the announce, or an
             # announce this build refuses to read. Either way the edge is UNKNOWN,
-            # and an unknown edge is a chain start.
+            # which makes this a second uncited log and the fold undecided.
             created = header.get("createdAt")
             record = OpenedRecord(
                 sid=unit,
@@ -766,8 +885,11 @@ def slot_chain_head(slot: str) -> str:
                     created if isinstance(created, int) and not isinstance(created, bool) else 0
                 ),
             )
-        if record.slot == slot:
-            records.append(record)
+        if record.slot != slot:
+            # The listing said this unit is this slot's and its own header does not.
+            # Nothing here can tell which reading is right, so neither is used.
+            return UNDECIDED
+        records.append(record)
     return fold_slot_head(records, slot)
 
 
@@ -816,6 +938,7 @@ def opened_record(
     created = header.get("createdAt")
     parent_slot: str | None = None
     previous_sid: str | None = None
+    previous_unknown = False
     if entry.type == TYPE_OPENED:
         parent = entry.data.get("parent")
         if isinstance(parent, dict):
@@ -839,12 +962,19 @@ def opened_record(
                 return None
             if isinstance(cited_sid, str) and cited_sid:
                 previous_sid = cited_sid
+        if previous_sid is None and entry.data.get("previous_undecided") is True:
+            # A predecessor exists and the writer could not determine it. That is not
+            # this log stating it starts the slot's chain -- the emitter records
+            # neither key for that -- so the absence here stays unknown and the fold
+            # refuses on it instead of passing over it.
+            previous_unknown = True
     return OpenedRecord(
         sid=sid,
         slot=slot if isinstance(slot, str) else "",
         created_at=created if isinstance(created, int) and not isinstance(created, bool) else 0,
         parent_slot=parent_slot,
         previous_sid=previous_sid,
+        previous_known=entry.type == TYPE_OPENED and not previous_unknown,
     )
 
 

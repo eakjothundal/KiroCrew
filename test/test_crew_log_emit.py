@@ -5639,33 +5639,52 @@ def test_the_turn_path_reads_the_predecessor_through_the_non_pruning_accessor():
     # Joined because the call can be wrapped across lines; the whole expression is
     # what this pins, so a line-at-a-time read could not see it.
     flat = " ".join(source.split())
-    found = re.findall(r"slot\.latch_crew_log_previous\( ?await [^)]*\) ?\)", flat)
+    found = re.findall(r"slot\.latch_crew_log_previous\([^)]*\)", flat)
     # Paren-adjacent spaces dropped, because whether a call fits on one line is the
     # formatter's business and this ratchet is about what feeds the latch.
     latches = [call.replace("( ", "(").replace(" )", ")") for call in found]
-    # Both allocation sites, each resolving the predecessor through the one helper
-    # that reads the store first. The `sessions` receiver differs because the
-    # prefetch is handed the boundary directly and the turn reaches it through
-    # `state`.
+    # Both allocation sites, each latching BOTH halves of what the one resolver
+    # answered. A site that passed only the sid would latch a slot with an
+    # undetermined predecessor as one that has none.
     assert latches == [
-        "slot.latch_crew_log_previous(await _slot_predecessor_store(sessions, slot, session_key))",
-        "slot.latch_crew_log_previous("
-        "await _slot_predecessor_store(state.sessions, slot, session_key))",
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided)",
+        "slot.latch_crew_log_previous(_previous.sid, undecided=_previous.undecided)",
     ], f"the predecessor is latched somewhere unexpected: {latches}"
+    # Each of those reads its pair from the one helper that consults the store first.
+    # The `sessions` receiver differs because the prefetch is handed the boundary
+    # directly and the turn reaches it through `state`.
+    resolutions = re.findall(r"_previous = await _slot_predecessor_store\([^)]*\)", flat)
+    assert resolutions == [
+        "_previous = await _slot_predecessor_store(sessions, slot, session_key)",
+        "_previous = await _slot_predecessor_store(state.sessions, slot, session_key)",
+    ], f"the predecessor is resolved somewhere unexpected: {resolutions}"
     # The store is the authority and the mapping is the fallback, read non-pruning,
     # inside that one helper -- so this ratchet pins one resolution rather than one
     # per call site.
     resolver = source[source.index("async def _slot_predecessor_store(") :]
     resolver = resolver[: resolver.index("\ndef ")]
     assert "await asyncio.to_thread(crew_log_emit.slot_previous_store, slot.key)" in resolver
-    assert "return derived or sessions.mapped_sid(session_key)" in resolver
-    # Spent exactly once, at the emitter call. A second consumer would hand the same
-    # edge to two entries; none would leave it for the slot's next store. Nothing is
-    # recorded in exchange: the entry IS the record of which store the slot is on.
+    # The mapping serves a DECIDED empty only, and only OUTSIDE the window where
+    # allocation is holding the prior resumable id back; the undecided case names no
+    # store while SAYING so, rather than citing the source the store read was
+    # preferred over or passing for a log that has no predecessor at all.
+    assert "CrewLogPrevious(sid=mapped, undecided=False)" in resolver
+    assert "provider_switch_replay_pending(session_key) is not True" in resolver
+    assert 'return CrewLogPrevious(sid="", undecided=True)' in resolver
+    # Spent exactly once, at the emitter call, which is also where the slot is told
+    # which store it is now on. A second consumer would hand the same edge to two
+    # entries; none would leave it for the slot's next store. The record is what names
+    # a store whose unit is still queued to the writer thread, so dropping it here
+    # reopens that window.
     takes = [line.strip() for line in source.splitlines() if "take_crew_log_previous(" in line]
     assert takes == [
-        "previous_sid=slot.take_crew_log_previous(),"
+        "_crew_log_edge = slot.take_crew_log_previous(now_writing=_crew_log_sid)"
     ], f"the predecessor edge is consumed somewhere unexpected: {takes}"
+    # BOTH halves reach the entry from that one handover. Feeding the emitter the sid
+    # alone would write a log that claims to start the slot's chain while its
+    # predecessor was merely undetermined.
+    assert "previous_sid=_crew_log_edge.sid," in source
+    assert "previous_undecided=_crew_log_edge.undecided," in source
 
 
 def test_the_predecessor_is_read_without_pruning_the_mapping():

@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, NamedTuple, TypeVar
 
 from aiohttp import web
 
@@ -2250,6 +2250,22 @@ def mint_tags_revision() -> str:
     return f"{epoch:016d}.{seq:020d}-{uuid.uuid4().hex[:8]}"
 
 
+class CrewLogPrevious(NamedTuple):
+    """What a `session/opened` should say about the store its slot was writing.
+
+    Three states, because an empty ``sid`` carries two different facts and a log
+    that records the wrong one reads as something it is not. ``sid`` set is the
+    predecessor, named. Empty with ``undecided`` false says the slot has no earlier
+    store, which makes this log a chain START. Empty with ``undecided`` true says it
+    HAS one that could not be determined, so the log is a chain BREAK -- a later
+    fold may pass over a chain start when ranking, and must refuse on a break rather
+    than electing the log before it.
+    """
+
+    sid: str
+    undecided: bool
+
+
 class SlotOrigin:
     """Slot creation origin — who initiated the slot.
 
@@ -2407,6 +2423,8 @@ class _ChatSlot:
         "served_model",
         "_session_requested_model",
         "_crew_log_previous_sid",
+        "_crew_log_previous_undecided",
+        "_crew_log_opened_sid",
         "reasoning_effort",
         "autocompact_pct",
         "mode",
@@ -2675,6 +2693,19 @@ class _ChatSlot:
         # than an earlier store. Cleared once `session/opened` has carried it, so
         # the next supersede of this slot latches afresh. "" = nothing to follow.
         self._crew_log_previous_sid: str = ""
+        # Whether the resolver COULD NOT NAME this slot's predecessor, as opposed to
+        # there being none. Both leave the id above empty and they are different
+        # facts: the first says an edge exists and is unrecorded, the second says the
+        # log is a chain start. The announce writes them differently so a later fold
+        # can pass over the chain start and refuse on the unrecorded one.
+        self._crew_log_previous_undecided: bool = False
+        # The store a `session/opened` of this slot was last written FOR, recorded
+        # as the edge above is handed over. It is what the slot's next allocation
+        # names as its predecessor: the mapping can be a generation behind while a
+        # replay is pending, and the store's own units carry a wall-clock stamp and
+        # are written by a background writer that may not have run yet. "" = this
+        # process has not opened a crew log for this slot.
+        self._crew_log_opened_sid: str = ""
         # The model id the live session resolved to, for a slot that is
         # inheriting rather than pinning. "" = unknown. Written through
         # `record_served_model`.
@@ -4353,7 +4384,7 @@ class _ChatSlot:
         """
         self.served_model = model_id or ""
 
-    def latch_crew_log_previous(self, sid: str) -> None:
+    def latch_crew_log_previous(self, sid: str, *, undecided: bool = False) -> None:
         """Remember the crew log store this slot was writing, if none is remembered.
 
         Called by every site that is about to ALLOCATE a session for this slot,
@@ -4366,36 +4397,63 @@ class _ChatSlot:
         cite, and an empty ``sid`` latches nothing rather than latching a store
         with no name.
 
-        ``sid`` is the predecessor the caller RESOLVED, not a source to choose
-        between: the store's own units decide it and the slot-to-session mapping
-        serves only where they answer nothing, and both of those live outside this
-        object. Nothing about which store the slot is on is kept here, deliberately.
-        A record on the slot is lost with the process that holds it, and the one
-        window where it is the only source -- a replay-pending allocation, whose
-        mapping is deliberately a generation behind -- is exactly the window a
-        restart lands in. The latch is per-handover state, spent inside one turn
-        (:meth:`take_crew_log_previous`), and holds nothing a later process needs.
-        """
-        if sid and not self._crew_log_previous_sid:
-            self._crew_log_previous_sid = sid
+        ``sid`` is what the slot's MAPPING answers, and the mapping is a proxy for
+        this question rather than its authority. An allocation whose history replay
+        is pending keeps the prior resumable id there deliberately, so that the id
+        a restart can resume stays durable -- and for that window the mapping names
+        a generation OLDER than the newest store this slot wrote. Latching it makes
+        two successive stores cite one predecessor and leaves the store between
+        them cited by nobody, which is the single chain gap a walker cannot detect:
+        both neighbours are well formed and neither says a store is missing.
 
-    def take_crew_log_previous(self) -> str:
-        """The latched predecessor store id, clearing it as it is handed over.
+        So what this slot last handed to a `session/opened` decides, and ``sid``
+        serves only when that is empty -- a slot this process has not yet opened a
+        crew log for. The slot's own record is the authority because it is the
+        statement of the writer itself, taken at the moment the store became this
+        slot's current one, which no other source observes: the mapping tracks
+        resumability instead, and the store's own units carry a wall-clock stamp
+        and are written by a background writer that has not run yet.
+        """
+        if self._crew_log_previous_sid:
+            return
+        chosen = self._crew_log_opened_sid or sid
+        if chosen:
+            self._crew_log_previous_sid = chosen
+            return
+        # Nothing nameable. ``undecided`` says WHY, and only here can it be known:
+        # the resolver that could not read the store is the one caller that can tell
+        # "this slot has no earlier store" from "it has one I could not name".
+        if undecided:
+            self._crew_log_previous_undecided = True
+
+    def take_crew_log_previous(self, *, now_writing: str) -> "CrewLogPrevious":
+        """The latched predecessor edge, clearing it as it is handed over.
 
         Read-and-clear, because the value is owed to exactly one
         ``session/opened``: leaving it behind would make the NEXT store of this
         slot cite a predecessor two links back and skip the store between them,
-        which is the one thing a chain walker cannot detect. Returns ``""`` when
-        nothing is latched, which the emitter reads as "no edge to write".
+        which is the one thing a chain walker cannot detect. An empty ``sid`` with
+        ``undecided`` false is "no edge to write".
 
-        Nothing is recorded in exchange. Which store the slot is now on is read
-        back from that store's own unit when the next allocation asks, so the entry
-        this value goes into IS the record, and there is no second copy of it here
-        to be lost on a restart or to disagree with the units.
+        Both halves leave in ONE call for the same reason ``now_writing`` does: the
+        sid and the reason it is empty are one statement, and a caller that could
+        take the sid alone would write a log that claims to be a chain start when
+        the truth is that its predecessor was never determined.
+
+        ``now_writing`` is the store that entry is FOR, and recording it here is
+        what lets the slot's next allocation name a predecessor without consulting
+        anything outside this process. It is recorded whether or not an entry is
+        written, since it states which store the slot is on rather than what was
+        appended.
         """
-        sid = self._crew_log_previous_sid
+        edge = CrewLogPrevious(
+            sid=self._crew_log_previous_sid, undecided=self._crew_log_previous_undecided
+        )
         self._crew_log_previous_sid = ""
-        return sid
+        self._crew_log_previous_undecided = False
+        if now_writing:
+            self._crew_log_opened_sid = now_writing
+        return edge
 
     def forget_session_model_state(self) -> None:
         """Drop every fact that described the session being torn down.

@@ -916,6 +916,29 @@ def test_a_record_names_no_previous_when_its_entry_omits_the_key() -> None:
     record = session_tree.opened_record(directory, header, entry)
     assert record is not None
     assert record.previous_sid is None
+    # And the announce was READ, so that absence is this log's own statement.
+    assert record.previous_known is True
+
+
+def test_a_first_entry_that_is_not_the_announce_leaves_the_edge_unknown() -> None:
+    """Retention took the creating segment, so no announce is there to read.
+
+    ``previous_sid`` is ``None`` here exactly as it is for a log that states it has
+    no predecessor, and the two must not be confused: this one recorded nothing, so
+    a fold may not pass over it, while a stated absence it may. Only the flag tells
+    them apart.
+    """
+    handle = _log("sid-truncated", "chat-1")
+    handle.append("session/turn", {"slot": "chat-1"}, src=GATEWAY)
+    directory = crew_store.unit_dir_for(lg.KIND_SESSION, "sid-truncated")
+    header, entry, _ = crew_store.read_head(crew_store.oldest_segment(directory))
+    record = session_tree.opened_record(directory, header, entry)
+    assert record is not None
+    assert record.previous_sid is None
+    assert record.previous_known is False, (
+        "a log whose announce was never read reported a STATED absence of a "
+        "predecessor, so a fold would pass over it and orphan it"
+    )
 
 
 def test_an_oversized_previous_sid_refuses_the_whole_record() -> None:

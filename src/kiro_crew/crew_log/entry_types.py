@@ -517,6 +517,19 @@ _SESSION_TYPES: tuple[EntryType, ...] = (
                 ),
             ),
             Field(
+                "previous_undecided",
+                JSON_BOOL,
+                note=(
+                    "True when a predecessor EXISTS and the gateway could not determine "
+                    "it, which ``previous`` being absent cannot express: that also "
+                    "describes the slot's FIRST store. The two demand opposite treatment "
+                    "from a reader ranking a slot's stores -- a first store may be passed "
+                    "over, an undetermined one may not, because passing over it elects "
+                    "the store before it and freezes a citation the gateway declined to "
+                    "guess. Absent when the predecessor is named, and on a first store."
+                ),
+            ),
+            Field(
                 "parent",
                 JSON_OBJECT,
                 fields=(
