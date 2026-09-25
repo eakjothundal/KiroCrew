@@ -2167,6 +2167,9 @@ class _ConnectedMgr:
     def token_ttl_remaining(self, instance_id):
         return None
 
+    def token_ttl_total(self, instance_id):
+        return None
+
     def last_error(self, instance_id):
         return None
 
@@ -2653,6 +2656,9 @@ class TestHandlers:
             def token_ttl_remaining(self, iid):
                 return 72000 if iid in self._tok else None
 
+            def token_ttl_total(self, iid):
+                return None
+
         state = _State(reg, FakeMgr())
         r = asyncio.run(handlers.api_instances_connect(_FakeReq(state, match={"id": "cd-1"})))
         assert r.status == 200 and _body(r)["token"] == "SECRET_TOK"
@@ -3000,6 +3006,9 @@ class TestHandlers:
                 return None  # never connected — no live tunnel
 
             def token_ttl_remaining(self, iid):
+                return None
+
+            def token_ttl_total(self, iid):
                 return None
 
             def last_error(self, iid):
@@ -3379,6 +3388,9 @@ class TestHandlers:
             def token_ttl_remaining(self, instance_id):
                 return None
 
+            def token_ttl_total(self, instance_id):
+                return None
+
         mgr = _FreshTunnelManager()
         mgr.reconfigure = _fake_reconfigure(mgr)  # type: ignore[method-assign]
         state = _State(reg, manager=mgr)
@@ -3477,6 +3489,9 @@ class TestHandlers:
             def token_ttl_remaining(self, instance_id):
                 return None
 
+            def token_ttl_total(self, instance_id):
+                return None
+
         state = _State(reg, manager=_OrderingManager())
         r = asyncio.run(
             handlers.api_instances_update(
@@ -3523,6 +3538,9 @@ class TestHandlers:
                 return None
 
             def token_ttl_remaining(self, instance_id):
+                return None
+
+            def token_ttl_total(self, instance_id):
                 return None
 
         state = _State(reg, manager=_WedgedManager())
