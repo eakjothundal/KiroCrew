@@ -179,6 +179,26 @@ class TestQuestions:
         assert "RULING" in prompt and "WORKING" in prompt
         assert point.NEEDS_OWNER_WAKE in prompt and point.NEEDS_OWNER_QUIET in prompt
 
+    def test_the_untrusted_content_caution_rides_on_every_request(self) -> None:
+        """It cannot live in the default brief's ``quiet_when``, so it lives here.
+
+        A loop carrying only the owner's ``wake_when`` has a criterion, so the shipped
+        default is never merged into it -- and the evidence it sends the judge still
+        includes comment and review bodies a third party wrote. The caution is ours and
+        unconditional, and it is stated for BOTH directions: prose can argue a watch
+        into a wake nobody needs as easily as into a silence.
+        """
+        for wake, quiet in (
+            ("", ""),
+            ("a reviewer asked for a change", ""),
+            ("", "workers say WORKING"),
+            ("wake on RULING", "quiet on WORKING"),
+        ):
+            prompt = point.build_questions(wake, quiet)[0].prompt
+            assert "third party wrote" in prompt, (wake, quiet)
+            assert "not itself evidence" in prompt, (wake, quiet)
+            assert "in either direction" in prompt, (wake, quiet)
+
     def test_criteria_are_clipped(self) -> None:
         questions = point.build_questions("w" * 5_000, "q" * 5_000)
         assert len(questions[0].prompt) < 2 * point.MAX_CRITERION_CHARS + 500
@@ -3023,6 +3043,165 @@ class TestTheReadingHappensBeforeTheJudge:
         assert calls == [loop.id]
         assert quiet is False, "an unowned quiet delivers rather than being charged as quiet"
 
+    def test_an_update_accepted_mid_tick_is_not_reverted(self, tmp_path) -> None:
+        """The staged copy is taken UNDER the lock, and that placement is the argument.
+
+        ``_apply_staged_monitor`` copies every field of the staged loop back over the
+        live one, so a copy taken before the lock reverts an update accepted in between
+        -- in memory and on disk alike, since the snapshot written carries the stale
+        value too and leaves nothing to recover from.
+        """
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        service._loops[loop.id] = loop
+        state = loop.monitor
+        assert state is not None
+
+        async def scenario() -> None:
+            # The ONE window an update can land in is while this tick waits for the
+            # lock: the update path takes the same lock, so it is otherwise strictly
+            # before or after. Hold the lock the way ``update`` does, let the tick
+            # block on it, apply the change, and release.
+            entered = asyncio.Event()
+            proceed = asyncio.Event()
+            applied: list[str] = []
+
+            async def updater() -> None:
+                async with service._lock:
+                    entered.set()
+                    await proceed.wait()
+                    loop.idle_secs = 4242
+                    applied.append("idle_secs")
+
+            updating = asyncio.ensure_future(updater())
+            await entered.wait()
+            publishing = asyncio.ensure_future(
+                service._publish_pr_observation(loop, state, self._observation())
+            )
+            # Nothing in that method awaits before the lock, so a waiter ON the lock
+            # is positive proof the tick reached it and got no further. Waiting for
+            # that rather than spinning a fixed number of times is the difference
+            # between pinning the window and releasing before the tick arrives.
+            for _ in range(200):
+                if getattr(service._lock, "_waiters", None):
+                    break
+                await asyncio.sleep(0)
+            assert getattr(
+                service._lock, "_waiters", None
+            ), "the tick must be waiting for the lock before the update lands"
+            proceed.set()
+            published = await publishing
+            await updating
+            assert applied == ["idle_secs"], "the update must have landed while the tick waited"
+            assert loop.idle_secs == 4242, "an update accepted mid-tick is not reverted"
+            assert published is not None, "and the reading is still kept"
+            assert state.last_observation, "and published to live readers"
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            service.stop()
+
+    def test_a_retarget_mid_tick_keeps_no_reading(self, tmp_path) -> None:
+        """Revalidated UNDER the lock, because the subject can change while it waits.
+
+        A retarget makes this reading one of a subject the loop does not watch, so
+        keeping it would screen the new subject against the old one's board. Nothing
+        is kept and the tick fires, the answer every uncertain path here resolves to.
+        """
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        service._loops[loop.id] = loop
+        state = loop.monitor
+        assert state is not None
+        assert not state.last_observation, "nothing is published before the tick runs"
+
+        async def scenario() -> None:
+            entered = asyncio.Event()
+            proceed = asyncio.Event()
+            applied: list[str] = []
+
+            async def retarget() -> None:
+                async with service._lock:
+                    entered.set()
+                    await proceed.wait()
+                    state.target = "acme/widgets#43"
+                    applied.append("target")
+
+            retargeting = asyncio.ensure_future(retarget())
+            await entered.wait()
+            publishing = asyncio.ensure_future(
+                service._publish_pr_observation(loop, state, self._observation())
+            )
+            for _ in range(200):
+                if getattr(service._lock, "_waiters", None):
+                    break
+                await asyncio.sleep(0)
+            assert getattr(
+                service._lock, "_waiters", None
+            ), "the tick must be waiting for the lock before the retarget lands"
+            proceed.set()
+            published = await publishing
+            await retargeting
+            assert applied == ["target"], "the retarget must have landed while it waited"
+            assert published is None, "a reading of a dropped subject is not kept"
+            assert not state.last_observation, "so nothing reaches live readers either"
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            service.stop()
+
+    def test_a_replaced_question_drops_the_pr_baseline(self, tmp_path) -> None:
+        """The baseline is the reading a VERDICT was reached on, so it dies with it.
+
+        That verdict answered the question an update has just replaced. Carrying the
+        digest forward lets an unchanged board screen the NEW criteria quiet without
+        ever putting them to the judge, bounded only by the streak floor. An update
+        that changes neither the instruction nor the criteria leaves it alone.
+        """
+        baseline = {"digest": "d" * 16, "remarks": ["r1"]}
+
+        async def main() -> None:
+            svc = AutoNudgeService(base_dir=tmp_path)
+            try:
+                loop = await svc.add(
+                    "chat-1-1",
+                    "Watch https://github.com/acme/widgets/pull/42 until green",
+                    idle_secs=60,
+                    judge={"wake_when": "a review asks for a change"},
+                )
+
+                loop.judge_pr_seen = dict(baseline)
+                revised = await svc.update(loop.id, judge={"wake_when": "a check goes red"})
+                assert revised is not None
+                assert revised.judge_pr_seen == {}, "replaced criteria drop the baseline"
+
+                loop.judge_pr_seen = dict(baseline)
+                moved = await svc.update(
+                    loop.id,
+                    message="Watch https://github.com/acme/widgets/pull/43 until green",
+                )
+                assert moved is not None
+                assert moved.judge_pr_seen == {}, "a replaced instruction drops it too"
+
+                loop.judge_pr_seen = dict(baseline)
+                untouched = await svc.update(loop.id, idle_secs=120)
+                assert untouched is not None
+                assert untouched.judge_pr_seen == baseline, "an interval change leaves it"
+            finally:
+                svc.stop()
+
+        asyncio.run(main())
+
     def test_a_failed_persist_publishes_nothing_and_fires(self, tmp_path, monkeypatch) -> None:
         """The durable record owns this state, so the write is a precondition.
 
@@ -3109,6 +3288,47 @@ class TestTheReadingHappensBeforeTheJudge:
         finally:
             service.stop()
 
+    def test_a_retarget_during_the_judge_leaves_the_baseline_cleared(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """The baseline answers a question an update is allowed to replace mid-tick.
+
+        A retarget clears ``judge_pr_seen`` deliberately, because a digest earned under
+        the old question would screen the new one quiet. The commit runs past an await
+        the update lands inside, so an unconditional commit puts the cleared value back
+        and suppresses the watch the owner just re-aimed until the streak floor. Same
+        comparison the judge call already makes twice, applied to the baseline.
+        """
+        import kiro_crew.autonudge as _an
+
+        async def on_fire(loop: NudgeLoop) -> bool:
+            return True
+
+        reading = self._observation()
+
+        def _poll(identity, message, probe):
+            probe.observation = reading
+            return _an.irq.Verdict(Outcome.QUIET, "pinned")
+
+        monkeypatch.setattr(_an.irq, "poll", _poll)
+        service = AutoNudgeService(base_dir=tmp_path, on_fire=on_fire)
+        loop = self._judged_pr_loop()
+        service._loops[loop.id] = loop
+
+        async def _retarget_then_answer(inner: NudgeLoop) -> bool | None:
+            # What ``update`` does to a retargeted loop, at the point it really lands:
+            # inside the await, after the reading was staged against the old message.
+            inner.message = "Watch https://github.com/acme/widgets/pull/43 until green"
+            inner.judge_pr_seen = {}
+            return None
+
+        service._judge_tick_is_quiet = _retarget_then_answer  # type: ignore[method-assign]
+        try:
+            assert asyncio.run(service._monitor_tick_is_quiet(loop)) is False
+            assert loop.judge_pr_seen == {}, "a re-aimed loop keeps its baseline cleared"
+        finally:
+            service.stop()
+
     def test_an_unchanged_reading_is_quiet_even_with_no_judge(self, tmp_path, monkeypatch) -> None:
         """The one judge-less quiet that is earned rather than assumed.
 
@@ -3135,6 +3355,31 @@ class TestTheReadingHappensBeforeTheJudge:
         assert (
             self._two_ticks(tmp_path, monkeypatch, first, changed) is False
         ), "a reading whose board moved must not be charged as quiet"
+
+    def test_two_identical_partial_readings_are_not_an_earned_quiet(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A digest match means an unchanged SUBJECT only if the subject was read whole.
+
+        A fetch that fails the same way twice produces byte-identical facts describing
+        only the rows it reached, so the match says the read half did not change and
+        nothing at all about the half that was not. A red required status sitting there
+        would be withheld to the streak floor. Wholeness is decided by the same
+        ``pr_target_is_unread`` rule the drop path uses, so the two cannot disagree.
+        """
+        from kiro_crew.probes import gh_pr
+
+        partial = self._observation(
+            status=gh_pr.STATUS_PARTIAL,
+            incomplete=("check runs: page 2 of 3 unread",),
+        )
+        again = self._observation(
+            status=gh_pr.STATUS_PARTIAL,
+            incomplete=("check runs: page 2 of 3 unread",),
+        )
+        assert (
+            self._two_ticks(tmp_path, monkeypatch, partial, again) is False
+        ), "an incomplete reading cannot earn the judge-less quiet however stable it is"
 
     def test_the_digest_ignores_when_the_reading_was_taken(self) -> None:
         """Otherwise the comparison never holds once.

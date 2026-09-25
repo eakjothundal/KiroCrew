@@ -59,6 +59,10 @@ from urllib.parse import urlparse
 
 from kiro_crew.github_runner import resolve_gh, run_gh
 from kiro_crew.irq import Probe, Tick, sanitize_label
+from kiro_crew.monitoring.models import (
+    MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET,
+    MAX_MONITOR_CHECK_IDENTITY_CHARS,
+)
 from kiro_crew.monitoring.pull_request import (
     ProviderErrorKind,
     classify_provider_error_text,
@@ -189,18 +193,45 @@ _RETRYABLE_RE = re.compile(
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
+def _bounded_check_identity(identity: str) -> str:
+    """One check identity, clipped to the canonical bound with a digest suffix.
+
+    The suffix is what keeps clipping from COLLIDING: two workflow names sharing a
+    long prefix would otherwise clip to the same string and read as one lane, which
+    is the failure a bound is supposed to avoid rather than introduce.
+    """
+    if len(identity) <= MAX_MONITOR_CHECK_IDENTITY_CHARS:
+        return identity
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return f"{identity[: MAX_MONITOR_CHECK_IDENTITY_CHARS - len(digest) - 1]}#{digest}"
+
+
+def _sanitized_body_with_clip(value: object, limit: int = _MAX_BODY_CHARS) -> tuple[str, bool]:
+    """*value* as bounded plain text, and whether the CLIP is what shortened it.
+
+    The normalisation shortens as well: a CRLF pair becomes one newline, runs of blank
+    lines collapse, and surrounding whitespace goes. So a length comparison against
+    what the forge returned marks any comment written in a web editor as truncated,
+    and that flag is durable -- it rides in the facts and renders to the judge as a
+    clipped body. Only the final slice truncates, so only the final slice sets it.
+    """
+    if not isinstance(value, str) or not value:
+        return "", False
+    text = _CONTROL_RE.sub(" ", value.replace("\r\n", "\n").replace("\r", "\n"))
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text[:limit], len(text) > limit
+
+
 def sanitize_body(value: object, limit: int = _MAX_BODY_CHARS) -> str:
     """*value* as bounded plain text, or ``""``.
 
     Control characters go, runs of blank lines collapse, and the result is clipped
     to *limit*. The judge's own per-item scrub is what decides whether a body may
-    be sent; this only makes it safe to hold, log and render.
+    be sent; this only makes it safe to hold, log and render. A caller that also
+    needs to know whether the clip fired reads :func:`_sanitized_body_with_clip`,
+    which this delegates to so the normalisation has one implementation.
     """
-    if not isinstance(value, str) or not value:
-        return ""
-    text = _CONTROL_RE.sub(" ", value.replace("\r\n", "\n").replace("\r", "\n"))
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text[:limit]
+    return _sanitized_body_with_clip(value, limit)[0]
 
 
 def _age_secs(raw: object, clock: float | None = None) -> float | None:
@@ -336,6 +367,45 @@ class PrObservation:
         """The check identities in one bucket, sorted for a stable reading."""
         return tuple(sorted(row.name for row in self.checks if row.bucket == name))
 
+    def _bounded_buckets(self) -> dict[str, list[str]]:
+        """The buckets as RETAINED, bounded the way the canonical writer bounds them.
+
+        These identities are third-party strings -- a contributor names their own
+        workflows and jobs -- and they are kept, not merely rendered: the facts become
+        the durable monitor record and are rewritten on every tick. A fork matrix can
+        carry up to ``_MAX_CHECK_PAGES * _CHECK_PAGE_SIZE`` rows, so an unbounded list
+        here puts hundreds of kilobytes of provider-chosen text into that record.
+
+        The caps and the overflow marker are the canonical writer's own names rather
+        than new literals, because this is one population with one bound: two numbers
+        for it would drift, and the reader holding the smaller one would disagree about
+        what a complete board is. Truncation is said out loud in the retained dict, so
+        a reader cannot mistake a clipped board for a whole one.
+        """
+        buckets = {
+            "failed": list(self.bucket("failing")),
+            "pending": list(self.bucket("pending")),
+            "passed": list(self.bucket("passing")),
+            "unknown": list(self.bucket("unknown")),
+            "superseded": list(self.bucket("noise")),
+        }
+        overflow = not self.checks_complete or any(
+            len(values) > MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET for values in buckets.values()
+        )
+        bounded = {
+            state: [
+                _bounded_check_identity(value)
+                for value in values[:MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET]
+            ]
+            for state, values in buckets.items()
+        }
+        if overflow:
+            bounded["unknown"] = [
+                *bounded["unknown"][: MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET - 1],
+                "checks:incomplete",
+            ]
+        return bounded
+
     def as_facts(self) -> dict[str, object]:
         """The durable half: typed facts and remark metadata, no bodies.
 
@@ -362,13 +432,7 @@ class PrObservation:
             "merge_state": self.merge_state,
             "review_decision": self.review_decision,
             "head_revision": self.head,
-            "checks": {
-                "failed": list(self.bucket("failing")),
-                "pending": list(self.bucket("pending")),
-                "passed": list(self.bucket("passing")),
-                "unknown": list(self.bucket("unknown")),
-                "superseded": list(self.bucket("noise")),
-            },
+            "checks": self._bounded_buckets(),
             "checks_complete": self.checks_complete,
             "checks_declared": self.checks_declared,
             "checks_read": self.checks_read,
@@ -866,7 +930,7 @@ def _remarks(data: dict, clock: float) -> tuple[tuple[Remark, ...], int]:
         total += 1
         if age > DEFAULT_REMARK_HORIZON_SECS:
             continue
-        body = sanitize_body(raw.get("body"))
+        body, body_clipped = _sanitized_body_with_clip(raw.get("body"))
         collected.append(
             Remark(
                 kind="comment",
@@ -875,7 +939,7 @@ def _remarks(data: dict, clock: float) -> tuple[tuple[Remark, ...], int]:
                 at=str(raw.get("createdAt") or ""),
                 age_s=age,
                 body=body,
-                clipped=len(str(raw.get("body") or "")) > len(body),
+                clipped=body_clipped,
             )
         )
     for raw in data.get("reviews") or []:
@@ -888,7 +952,7 @@ def _remarks(data: dict, clock: float) -> tuple[tuple[Remark, ...], int]:
         total += 1
         if age > DEFAULT_REMARK_HORIZON_SECS:
             continue
-        body = sanitize_body(raw.get("body"))
+        body, body_clipped = _sanitized_body_with_clip(raw.get("body"))
         collected.append(
             Remark(
                 kind="review",
@@ -898,7 +962,7 @@ def _remarks(data: dict, clock: float) -> tuple[tuple[Remark, ...], int]:
                 age_s=age,
                 verdict=sanitize_label(raw.get("state")) or "REVIEW",
                 body=body,
-                clipped=len(str(raw.get("body") or "")) > len(body),
+                clipped=body_clipped,
             )
         )
     collected.sort(key=lambda remark: remark.age_s)

@@ -149,6 +149,21 @@ class _Forge:
         return self
 
 
+def _bare_observation(**fields):
+    """A reading built directly, for assertions about what ``as_facts`` RETAINS."""
+    base = {
+        "repo": "acme/widgets",
+        "pr": 42,
+        "host": "github.com",
+        "status": gh_pr.STATUS_OK,
+        "observed_at": 1_000.0,
+        "state": "OPEN",
+        "head": "a" * 40,
+    }
+    base.update(fields)
+    return gh_pr.PrObservation(**base)
+
+
 def _core_calls(forge: "_Forge") -> int:
     """How many times the forge was asked for the pull request itself.
 
@@ -891,6 +906,74 @@ class TestWhatPeopleSaidIsCarried:
         assert gh_pr.sanitize_body("a\n\n\n\n\nb") == "a\n\nb"
         assert gh_pr.sanitize_body(None) == ""
         assert gh_pr.sanitize_body(12) == ""
+
+    def test_the_retained_buckets_are_bounded_like_the_canonical_record(self) -> None:
+        """These identities are third-party and they are KEPT, so they need a bound.
+
+        The facts become the durable monitor record and are rewritten every tick, and a
+        fork matrix names its own workflows, so an unbounded list is provider-chosen
+        text in the record. The caps are the canonical writer's, because one population
+        with two bounds drifts and the reader holding the smaller one disagrees about
+        what a whole board is.
+        """
+        per_bucket = gh_pr.MAX_MONITOR_CHECK_IDENTITIES_PER_BUCKET
+        chars = gh_pr.MAX_MONITOR_CHECK_IDENTITY_CHARS
+        shared = "w" * (chars + 40)
+        rows = [
+            gh_pr.CheckRow(f"CI / lane{i:04d}", f"lane{i:04d}", "failing", "")
+            for i in range(per_bucket + 25)
+        ]
+        rows.append(gh_pr.CheckRow(f"{shared}/one", "one", "pending", ""))
+        rows.append(gh_pr.CheckRow(f"{shared}/two", "two", "pending", ""))
+        observation = _bare_observation(checks=tuple(rows), checks_complete=True)
+        checks = observation.as_facts()["checks"]
+
+        assert len(checks["failed"]) == per_bucket, "an over-full bucket is sliced"
+        assert all(len(name) <= chars for names in checks.values() for name in names)
+        pending = checks["pending"]
+        assert len(pending) == 2
+        assert len(set(pending)) == 2, "a clip must not collapse two lanes into one"
+        assert all(name[chars - 17] == "#" for name in pending), "each keeps a digest suffix"
+        assert "checks:incomplete" in checks["unknown"], "truncation is said out loud"
+
+    def test_a_whole_small_board_is_left_alone(self) -> None:
+        """The bound may not invent a truncation marker on a board that fits."""
+        observation = _bare_observation(
+            checks=(gh_pr.CheckRow("CI / Lint", "Lint", "failing", ""),),
+            checks_complete=True,
+        )
+        checks = observation.as_facts()["checks"]
+        assert checks["failed"] == ["CI / Lint"]
+        assert "checks:incomplete" not in checks["unknown"]
+        assert checks["unknown"] == []
+
+    def test_only_the_clip_marks_a_body_clipped(self) -> None:
+        """Normalisation shortens too, so length alone cannot say the body was cut.
+
+        A CRLF pair becomes one newline, a run of blank lines collapses, and outer
+        whitespace goes -- so comparing against what the forge returned marks any
+        comment written in a web editor as truncated. That flag is durable and renders
+        to the judge as a clipped body, which invites a reader to discount prose that
+        is in fact complete.
+        """
+        for whole in (
+            "line one\r\nline two\r\nline three",
+            "a\n\n\n\n\nb",
+            "   padded on both sides   ",
+            "plain",
+        ):
+            text, clipped = gh_pr._sanitized_body_with_clip(whole)
+            assert text, whole
+            assert clipped is False, whole
+
+        over = "x" * (gh_pr._MAX_BODY_CHARS + 10)
+        text, clipped = gh_pr._sanitized_body_with_clip(over)
+        assert clipped is True, "a body past the limit is genuinely cut"
+        assert len(text) == gh_pr._MAX_BODY_CHARS
+
+        exact = "y" * gh_pr._MAX_BODY_CHARS
+        _text, clipped = gh_pr._sanitized_body_with_clip(exact)
+        assert clipped is False, "a body exactly at the limit is not cut"
 
     def test_a_quiet_tick_leaves_a_digest_of_what_was_screened(self, monkeypatch) -> None:
         """A wrong quiet has to be examinable, and the bodies are gone after the tick.
