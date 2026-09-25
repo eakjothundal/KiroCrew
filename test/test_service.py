@@ -19,6 +19,7 @@ import os
 import plistlib
 import re
 import shlex
+import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
@@ -48,6 +49,121 @@ def _clear_sudo_user(monkeypatch):
     explicitly themselves.
     """
     monkeypatch.delenv("SUDO_USER", raising=False)
+
+
+_UNIT = f"{SERVICE_NAME}.service"
+_RUNNING = {"ActiveState": "active", "SubState": "running"}
+_DEAD = {"ActiveState": "inactive", "SubState": "dead"}
+_NO_BUS = "Failed to connect to bus: No medium found"
+
+
+def _fake_systemctl(
+    system=None,
+    user=None,
+    *,
+    user_bus_error=None,
+    user_fragment="",
+    user_id=_UNIT,
+    user_load="loaded",
+    system_load="loaded",
+    system_id=_UNIT,
+    overrides=None,
+    stop_is_ignored=False,
+):
+    """A ``subprocess.run`` stand-in that answers systemctl per SCOPE and VERB.
+
+    ``system`` / ``user`` describe the unit in that scope: ``None`` is a scope
+    with no unit (systemd answers ``LoadState=not-found``), a dict is the
+    ``ActiveState`` / ``SubState`` pair of a loaded unit. ``user_bus_error`` makes
+    every ``systemctl --user`` call fail the way an unreachable user manager does
+    (exit 1, the diagnostic on stderr, nothing on stdout). ``user_fragment`` is the
+    ``FragmentPath`` systemd reports for the user unit, ``user_id`` the canonical
+    ``Id`` it resolves the name to (another unit's name when ours is an alias) and
+    ``user_load`` / ``system_load`` its ``LoadState`` (``masked`` for a mask, which
+    a running unit keeps running under). ``overrides`` maps a verb to the
+    ``CompletedProcess`` it should return instead, for the one-verb-fails cases (a
+    restart the manager refuses).
+
+    The fake is stateful the way the manager is: a scope told to ``stop`` (and
+    not refused) answers ``inactive (dead)`` to every later ``show`` /
+    ``is-active`` / ``status`` -- unless ``stop_is_ignored``, which models a stop
+    job that returned 0 while the unit is still up.
+
+    Nothing here spawns anything: the whole point of the fixture is that the
+    systemd user manager is host state and must never be touched from a test.
+    Every argv is recorded on ``run.calls`` so tests can assert scope and sudo.
+    """
+    verbs = {"show", "status", "is-active", "stop", "disable", "restart", "daemon-reload"}
+
+    def run(argv, *_a, **_k):
+        tokens = list(argv)
+        run.calls.append(tokens)
+        user_scope = "--user" in tokens
+        verb = next((t for t in tokens if t in verbs), None)
+        if user_scope and user_bus_error is not None:
+            return subprocess.CompletedProcess(tokens, 1, "", user_bus_error + "\n")
+        if overrides and verb in overrides:
+            return overrides[verb]
+        props = user if user_scope else system
+        scope = "user" if user_scope else "system"
+        if verb == "stop" and not stop_is_ignored:
+            run.stopped.add(scope)
+        if props is not None and scope in run.stopped:
+            props = _DEAD
+        if verb == "show":
+            if props is None:
+                body = (
+                    f"Id={_UNIT}\nLoadState=not-found\nActiveState=inactive\n"
+                    "SubState=dead\nFragmentPath=\n"
+                )
+            else:
+                fragment = user_fragment if user_scope else "/etc/systemd/system/" + _UNIT
+                unit_id = user_id if user_scope else system_id
+                load = user_load if user_scope else system_load
+                body = (
+                    f"Id={unit_id}\nLoadState={load}\nActiveState={props['ActiveState']}\n"
+                    f"SubState={props['SubState']}\nFragmentPath={fragment}\n"
+                )
+            return subprocess.CompletedProcess(tokens, 0, body, "")
+        if verb == "is-active":
+            state = (props or _DEAD)["ActiveState"]
+            return subprocess.CompletedProcess(tokens, 0 if state == "active" else 3, state + "\n", "")
+        if verb == "status":
+            if props is None:
+                return subprocess.CompletedProcess(
+                    tokens, 4, "", f"Unit {_UNIT} could not be found.\n"
+                )
+            rc = 0 if props["ActiveState"] == "active" else 3
+            block = (
+                f"● {_UNIT} - Kiro Crew gateway ({scope} scope block)\n"
+                f"     Active: {props['ActiveState']} ({props['SubState']})\n"
+            )
+            return subprocess.CompletedProcess(tokens, rc, block, "")
+        return subprocess.CompletedProcess(tokens, 0, "", "")
+
+    run.calls = []
+    run.stopped = set()
+    return run
+
+
+def _systemctl_stub(unit_path):
+    """A ``linux._systemctl`` stand-in for tests that patch the module function
+    itself: the system scope holds a LOADED, stopped unit at *unit_path*, the user
+    scope holds nothing, and every verb succeeds."""
+
+    def _systemctl(*args, **kwargs):
+        if args and args[0] == "show":
+            if kwargs.get("user"):
+                body = f"Id={_UNIT}\nLoadState=not-found\nActiveState=inactive\nSubState=dead\nFragmentPath=\n"
+            else:
+                body = (
+                    f"Id={_UNIT}\nLoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+                    f"FragmentPath={unit_path}\n"
+                )
+            return subprocess.CompletedProcess(list(args), 0, body, "")
+        return subprocess.CompletedProcess(list(args), 0, "", "")
+
+    return _systemctl
 
 
 class TestPlatformDetection:
@@ -371,12 +487,18 @@ class TestLinuxUnitRendering:
     def test_uninstall_is_idempotent_when_unit_missing(self, tmp_path, monkeypatch):
         from kiro_crew.service import linux as svc_linux
 
-        # Point UNIT_PATH at a nonexistent file; uninstall should be a no-op.
+        # Point UNIT_PATH at a nonexistent file; the system scope is left alone
+        # (no sudo, no stop/disable) and only the user scope is QUERIED, so an
+        # uninstall on a host with nothing installed never prompts for a password.
         unit_path = tmp_path / "missing.service"
         monkeypatch.setattr(svc_linux, "UNIT_PATH", unit_path)
-        with patch("kiro_crew.service.linux.subprocess.run") as run:
-            svc_linux.uninstall()
-        run.assert_not_called()
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        run = _fake_systemctl(system=None, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+        assert report.system == "not installed"
+        assert report.user == "not installed"
+        assert all(c[:3] == ["systemctl", "--user", "show"] for c in run.calls), run.calls
 
 
 class TestLinuxPrivilegeResolution:
@@ -496,9 +618,14 @@ class TestLinuxPrivilegeResolution:
         from kiro_crew.service import linux as svc_linux
 
         monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        active = _fake_systemctl(system=_RUNNING, user=None)
 
-        def _boom(*_a, **_k):
-            raise FileNotFoundError("sudo")
+        def _boom(argv, *a, **k):
+            # Only the escalated spawn is missing its binary; the unprivileged
+            # `is-active` queries that gate restart() answer normally.
+            if list(argv)[:1] == ["sudo"]:
+                raise FileNotFoundError("sudo")
+            return active(argv, *a, **k)
 
         monkeypatch.setattr(svc_linux.subprocess, "run", _boom)
         res = svc_linux._sudo_run("systemctl", "restart", "kirocrew.service")
@@ -622,7 +749,7 @@ class TestLinuxEnvironmentFile:
             return MagicMock(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(svc_linux, "_sudo_run", _fake_sudo)
-        monkeypatch.setattr(svc_linux, "_systemctl", lambda *a, **k: MagicMock(returncode=0))
+        monkeypatch.setattr(svc_linux, "_systemctl", _systemctl_stub(unit))
         svc_linux.uninstall()
         # The unit is removed; the operator's env file is NOT.
         assert str(unit) in removed
@@ -649,7 +776,7 @@ class TestLinuxEnvironmentFile:
             return MagicMock(returncode=0, stdout="", stderr="")
 
         monkeypatch.setattr(svc_linux, "_sudo_run", _fake_sudo)
-        monkeypatch.setattr(svc_linux, "_systemctl", lambda *a, **k: MagicMock(returncode=0))
+        monkeypatch.setattr(svc_linux, "_systemctl", _systemctl_stub(unit))
         svc_linux.uninstall()
         assert str(env_file) in removed
 
@@ -1243,10 +1370,11 @@ class TestControllerDispatch:
         from kiro_crew.service import controller
         from kiro_crew.service import linux as svc_linux
 
+        report = svc_linux.UninstallReport("removed (/etc/x.service)", "not installed")
         with patch(
             "kiro_crew.service.controller.current_platform",
             return_value=Platform.SYSTEMD,
-        ), patch.object(svc_linux, "uninstall") as mock_un:
+        ), patch.object(svc_linux, "uninstall", return_value=report) as mock_un:
             rc = controller.uninstall_service()
         assert rc == 0
         mock_un.assert_called_once()
@@ -1383,12 +1511,12 @@ class TestLinuxControlPaths:
         sentinel.write_text("user data")
         monkeypatch.setenv("KIROCREW_HOME", str(data_home))
         monkeypatch.setattr(svc_linux, "UNIT_PATH", unit_path)
-        ok = MagicMock(returncode=0, stdout="", stderr="")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=ok
-        ) as run:
+        # A unit the system manager has LOADED (stopped): the teardown must stop
+        # and disable it before the file goes.
+        run = _fake_systemctl(system=_DEAD, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             svc_linux.uninstall()
-        called = [list(c.args[0]) for c in run.call_args_list]
+        called = run.calls
         # Each step must use sudo since /etc/systemd/system requires root.
         assert ["sudo", "systemctl", "stop", f"{SERVICE_NAME}.service"] in called
         assert ["sudo", "systemctl", "disable", f"{SERVICE_NAME}.service"] in called
@@ -1401,47 +1529,39 @@ class TestLinuxControlPaths:
     def test_is_active_returns_true_when_systemctl_says_active(self):
         from kiro_crew.service import linux as svc_linux
 
-        active_result = MagicMock(returncode=0, stdout="active\n", stderr="")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=active_result
-        ) as run:
+        run = _fake_systemctl(system=_RUNNING, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             assert svc_linux.is_active() is True
-        # is_active must NOT use sudo (status is queryable as a regular user).
-        called = [list(c.args[0]) for c in run.call_args_list]
-        assert all("sudo" not in c for c in called), (
-            f"is_active must not call sudo; got {called}"
+        # is_active must NOT use sudo (state is queryable as a regular user).
+        assert all("sudo" not in c for c in run.calls), (
+            f"is_active must not call sudo; got {run.calls}"
         )
 
     def test_is_active_returns_false_when_inactive(self):
         from kiro_crew.service import linux as svc_linux
 
-        inactive_result = MagicMock(returncode=3, stdout="inactive\n", stderr="")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=inactive_result
-        ):
+        run = _fake_systemctl(system=_DEAD, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             assert svc_linux.is_active() is False
 
     def test_stop_invokes_systemctl_stop(self):
         from kiro_crew.service import linux as svc_linux
 
-        ok = MagicMock(returncode=0, stdout="", stderr="")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=ok
-        ) as run:
+        # stop() acts on the scope(s) running the unit, so the system unit must
+        # answer `show` first (unprivileged); the stop itself still goes through sudo.
+        run = _fake_systemctl(system=_RUNNING, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             svc_linux.stop()
-        called = [list(c.args[0]) for c in run.call_args_list]
-        assert ["sudo", "systemctl", "stop", f"{SERVICE_NAME}.service"] in called
+        assert ["sudo", "systemctl", "stop", f"{SERVICE_NAME}.service"] in run.calls
+        assert not any("--user" in c and "stop" in c for c in run.calls), run.calls
 
     def test_restart_returns_true_on_success(self):
         from kiro_crew.service import linux as svc_linux
 
-        ok = MagicMock(returncode=0, stdout="", stderr="")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=ok
-        ) as run:
+        run = _fake_systemctl(system=_RUNNING, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             assert svc_linux.restart() is True
-        called = [list(c.args[0]) for c in run.call_args_list]
-        assert ["sudo", "systemctl", "restart", f"{SERVICE_NAME}.service"] in called
+        assert ["sudo", "systemctl", "restart", f"{SERVICE_NAME}.service"] in run.calls
 
     def test_restart_returns_false_on_nonzero_exit(self):
         # An unprivileged / failed systemctl restart exits non-zero (systemd
@@ -1450,11 +1570,13 @@ class TestLinuxControlPaths:
         # bug: the outcome has to reach restart_service() and its caller.
         from kiro_crew.service import linux as svc_linux
 
-        failed = MagicMock(returncode=1, stdout="", stderr="Interactive authentication required")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=failed
-        ):
+        refused = subprocess.CompletedProcess(
+            [], 1, "", "Interactive authentication required"
+        )
+        run = _fake_systemctl(system=_RUNNING, user=None, overrides={"restart": refused})
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             assert svc_linux.restart() is False
+        assert ["sudo", "systemctl", "restart", f"{SERVICE_NAME}.service"] in run.calls
 
     def test_restart_invokes_systemctl_restart_atomic(self):
         # systemctl restart is preferred over stop+start: it's a single
@@ -1462,12 +1584,10 @@ class TestLinuxControlPaths:
         # stays in charge of the lifecycle the whole time.
         from kiro_crew.service import linux as svc_linux
 
-        ok = MagicMock(returncode=0, stdout="", stderr="")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=ok
-        ) as run:
+        run = _fake_systemctl(system=_RUNNING, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             svc_linux.restart()
-        called = [list(c.args[0]) for c in run.call_args_list]
+        called = run.calls
         assert [
             "sudo", "systemctl", "restart", f"{SERVICE_NAME}.service"
         ] in called
@@ -1480,27 +1600,22 @@ class TestLinuxControlPaths:
     def test_status_returns_systemctl_output(self):
         from kiro_crew.service import linux as svc_linux
 
-        result = MagicMock(
-            returncode=0, stdout="● kirocrew.service - active\n", stderr=""
-        )
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=result
-        ) as run:
+        run = _fake_systemctl(system=_RUNNING, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             out = svc_linux.status()
-        assert "kirocrew.service" in out
+        # The scope with a unit carries its `systemctl status` block.
+        assert f"● {SERVICE_NAME}.service - Kiro Crew gateway (system scope block)" in out
         # status() must NOT use sudo.
-        called = [list(c.args[0]) for c in run.call_args_list]
-        assert all("sudo" not in c for c in called)
+        assert all("sudo" not in c for c in run.calls)
 
     def test_status_falls_back_to_stderr_when_stdout_empty(self):
         from kiro_crew.service import linux as svc_linux
 
-        result = MagicMock(returncode=4, stdout="", stderr="not found\n")
-        with patch(
-            "kiro_crew.service.linux.subprocess.run", return_value=result
-        ):
+        quiet = subprocess.CompletedProcess([], 3, "", "status printed to stderr\n")
+        run = _fake_systemctl(system=_RUNNING, user=None, overrides={"status": quiet})
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
             out = svc_linux.status()
-        assert "not found" in out
+        assert "status printed to stderr" in out
 
     def _run_responder(self, *steps_and_results: tuple):
         """Helper: route subprocess.run by inspecting the command being run.
@@ -1606,6 +1721,826 @@ class TestLinuxControlPaths:
             side_effect=FileNotFoundError("id"),
         ):
             assert svc_linux._current_group("alice") == "alice"
+
+
+class TestLinuxServiceScopes:
+    """``status`` / ``is_active`` / ``uninstall`` (and the ``stop`` / ``restart``
+    that ``is_active`` gates) see BOTH systemd scopes and name the one they
+    report on, so a gateway running as the SELinux remedy's user unit is never
+    reported as a dead system unit.
+
+    The systemctl runner is mocked in every test: the systemd user manager is
+    host state, and a real ``systemctl --user`` from here would touch the
+    operator's own units.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _not_root(self, monkeypatch, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 1000, raising=False)
+        monkeypatch.setenv("USER", "tester")
+        # No system unit file unless a test writes one: uninstall's system-scope
+        # probe is a stat of this path.
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", tmp_path / "absent" / _UNIT)
+
+    @staticmethod
+    def _user_calls(run):
+        return [c for c in run.calls if "--user" in c]
+
+    # -- status -------------------------------------------------------------
+
+    def test_status_names_a_running_user_unit_when_the_system_unit_is_absent(self):
+        """The reported bug: a running user-scope gateway read as 'inactive (dead)'."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=_RUNNING)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+            active = svc_linux.is_active()
+
+        assert "system scope: not installed" in out
+        assert "user scope: active (running)" in out
+        assert "inactive (dead)" not in out, out
+        assert active is True
+        assert any(c[:3] == ["systemctl", "--user", "show"] for c in run.calls), run.calls
+        assert all("sudo" not in c for c in run.calls), run.calls
+
+    def test_status_reports_both_scopes_as_not_installed(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+            active = svc_linux.is_active()
+
+        assert "system scope: not installed" in out
+        assert "user scope: not installed" in out
+        assert "inactive" not in out, out
+        assert "could not be found" not in out, out
+        assert active is False
+
+    def test_status_reports_an_unreachable_user_bus_as_not_reachable(self):
+        """No session bus (root without a login session, a stripped environment):
+        the user scope is 'not reachable from this shell', never 'inactive'."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=_RUNNING, user_bus_error=_NO_BUS)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+            active = svc_linux.is_active()
+
+        assert "system scope: active (running)" in out
+        assert "user scope: not reachable from this shell" in out
+        assert _NO_BUS in out
+        assert "user scope: inactive" not in out
+        assert "user scope: not installed" not in out
+        assert active is True
+
+    def test_status_keeps_the_system_block_and_adds_the_user_line(self):
+        """A system unit that is active keeps its `systemctl status` block."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=_RUNNING, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+
+        system_line = out.index("system scope: active (running)")
+        block = out.index(f"● {_UNIT} - Kiro Crew gateway (system scope block)")
+        user_line = out.index("user scope: not installed")
+        assert system_line < block < user_line, out
+        assert any(c[:3] == ["systemctl", "status", _UNIT] for c in run.calls), run.calls
+        assert all("sudo" not in c for c in run.calls), run.calls
+
+    def test_status_shows_an_installed_but_stopped_system_unit_beside_the_user_unit(self):
+        """The reporter's host: a disabled system unit AND the real user unit."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=_DEAD, user=_RUNNING)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+            active = svc_linux.is_active()
+
+        assert "system scope: inactive (dead)" in out
+        assert "user scope: active (running)" in out
+        assert f"● {_UNIT} - Kiro Crew gateway (user scope block)" in out
+        assert active is True
+
+    def test_the_user_scope_spawn_carries_the_shared_backfilled_bus_env(
+        self, monkeypatch, tmp_path
+    ):
+        """A shell spawned from a system unit (the gateway's own) inherits neither
+        `XDG_RUNTIME_DIR` nor `DBUS_SESSION_BUS_ADDRESS`; the pod runtime already
+        backfills both from the account's runtime dir when the bus socket exists.
+        The service module's `systemctl --user` goes through the SAME resolver, so
+        an `unreachable` reading is a host fact, never a missing-variable artifact.
+        The system-scope spawn is left with the inherited environment."""
+        from kiro_crew.pod import runtime as pod_runtime
+        from kiro_crew.service import common as svc_common
+        from kiro_crew.service import linux as svc_linux
+
+        runtime_dir = tmp_path / "run"
+        runtime_dir.mkdir()
+        (runtime_dir / "bus").touch()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime_dir))
+        monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+        inner = _fake_systemctl(system=None, user=_RUNNING)
+        envs: list[tuple[list[str], dict | None]] = []
+
+        def run(argv, *a, **kw):
+            envs.append((list(argv), kw.get("env")))
+            return inner(argv, *a, **kw)
+
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            svc_linux.status()
+
+        user_envs = [env for argv, env in envs if "--user" in argv]
+        assert user_envs, envs
+        for env in user_envs:
+            assert env is not None
+            assert env["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={runtime_dir / 'bus'}"
+            assert env["XDG_RUNTIME_DIR"] == str(runtime_dir)
+        assert all(env is None for argv, env in envs if "--user" not in argv), envs
+        # One resolver, two callers: the pod runtime's env is the same mapping plus
+        # its own locale pin, so the two spawn sites cannot diverge on the bus again.
+        shared = svc_common.systemctl_user_env()
+        assert pod_runtime._systemctl_env() == {**shared, "LC_ALL": "C"}
+        assert pod_runtime._session_runtime_dir is svc_common.session_runtime_dir
+
+    def test_status_never_queries_a_user_scope_from_a_root_shell(self, monkeypatch):
+        """Under sudo the process is root: `systemctl --user` would reach ROOT's
+        manager, not the account's, so the scope is reported unreachable and no
+        user-scope systemctl is spawned at all."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.os, "geteuid", lambda: 0, raising=False)
+        monkeypatch.setenv("SUDO_USER", "tester")
+        run = _fake_systemctl(system=None, user=_RUNNING)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+            active = svc_linux.is_active()
+
+        assert "user scope: not reachable from this shell" in out
+        assert "tester" in out
+        assert self._user_calls(run) == [], run.calls
+        assert active is False
+
+    # -- stop / restart follow the widened is_active -------------------------
+
+    def test_stop_acts_on_the_scope_where_the_unit_runs(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=_RUNNING)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            svc_linux.stop()
+
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls, run.calls
+        assert all("sudo" not in c for c in run.calls), run.calls
+
+    def test_restart_acts_on_the_scope_where_the_unit_runs(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=_RUNNING)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            assert svc_linux.restart() is True
+
+        assert ["systemctl", "--user", "restart", _UNIT] in run.calls, run.calls
+        assert all("sudo" not in c for c in run.calls), run.calls
+
+    def test_restart_reports_false_when_no_scope_runs_the_unit(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            assert svc_linux.restart() is False
+
+        assert not any("restart" in c for c in run.calls), run.calls
+
+    # -- uninstall ---------------------------------------------------------
+
+    def test_uninstall_removes_a_user_unit_via_the_user_manager(self, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        fragment = tmp_path / ".config" / "systemd" / "user" / _UNIT
+        fragment.parent.mkdir(parents=True)
+        fragment.write_text("[Unit]\n", encoding="utf-8")
+        run = _fake_systemctl(system=None, user=_RUNNING, user_fragment=str(fragment))
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.system == "not installed"
+        assert report.user == f"removed ({fragment})"
+        assert not fragment.exists()
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+        assert ["systemctl", "--user", "disable", _UNIT] in run.calls
+        assert ["systemctl", "--user", "daemon-reload"] in run.calls
+        assert all("sudo" not in c for c in run.calls), run.calls
+
+    def test_uninstall_with_nothing_installed_removes_nothing_and_says_so(self, capsys):
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=None)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", return_value=MagicMock(message="")):
+            report = svc_linux.uninstall()
+            rc = controller.uninstall_service()
+
+        assert report.system == "not installed"
+        assert report.user == "not installed"
+        assert not any(c[-2:-1] in (["stop"], ["disable"]) for c in run.calls), run.calls
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "system scope: not installed" in out
+        assert "user scope: not installed" in out
+        assert "stopped and removed" not in out
+
+    def test_uninstall_leaves_an_unreachable_user_scope_alone_and_names_it(self):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user_bus_error=_NO_BUS)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.system == "not installed"
+        assert report.user.startswith("not reachable from this shell")
+        assert _NO_BUS in report.user
+        assert self._user_calls(run) == [["systemctl", "--user", "show", "-p", "Id", "-p",
+                                          "LoadState", "-p", "ActiveState", "-p", "SubState",
+                                          "-p", "FragmentPath", _UNIT]], run.calls
+
+    def test_uninstall_removes_both_scopes_and_the_controller_names_each(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir(parents=True)
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        fragment = tmp_path / "user" / _UNIT
+        fragment.parent.mkdir(parents=True)
+        fragment.write_text("", encoding="utf-8")
+        run = _fake_systemctl(system=_DEAD, user=_RUNNING, user_fragment=str(fragment))
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", return_value=MagicMock(message="")):
+            rc = controller.uninstall_service()
+
+        assert rc == 0
+        assert ["sudo", "systemctl", "stop", _UNIT] in run.calls
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+        assert not fragment.exists()
+        out = capsys.readouterr().out
+        assert "✅ kirocrew service stopped and removed." in out
+        assert f"system scope: removed ({system_unit})" in out
+        assert f"user scope: removed ({fragment})" in out
+
+    def test_a_user_unit_file_that_cannot_be_removed_is_reported_not_raised(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The system scope is already torn down by the time the user unit file is
+        unlinked, so a failure there must not raise: the controller would exit
+        before printing the system line and before removing the AppArmor grant."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        fragment = tmp_path / "ro" / _UNIT
+        fragment.parent.mkdir()
+        fragment.write_text("", encoding="utf-8")
+        run = _fake_systemctl(system=_DEAD, user=_RUNNING, user_fragment=str(fragment))
+        profile_removed: list[bool] = []
+
+        def remove_profile():
+            profile_removed.append(True)
+            return MagicMock(message="AppArmor profile removed", ok=True)
+
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.linux.os.unlink", side_effect=PermissionError("Operation not permitted")
+        ), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", remove_profile):
+            rc = controller.uninstall_service()
+
+        assert rc == 1
+        assert profile_removed == [True]
+        out = capsys.readouterr().out
+        assert f"system scope: removed ({system_unit})" in out
+        assert "user scope: stopped and disabled, but its unit file" in out
+        assert str(fragment) in out and "daemon-reload" in out
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+
+    # -- a teardown step the manager refuses never reaches the unit file ------
+
+    _REFUSED_STOP = subprocess.CompletedProcess(
+        [],
+        1,
+        "",
+        f"Failed to stop {_UNIT}: Operation refused, unit {_UNIT} may be requested by "
+        "dependency only (it is configured to refuse manual start/stop).\n",
+    )
+
+    def test_a_refused_user_stop_leaves_the_unit_file_in_place_and_exits_1(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """`RefuseManualStop=yes` (or a bus that went away mid-run): the stop does
+        not take, so the unit is still loaded and possibly running. Its file must
+        stay -- unlinking it would leave a running gateway with no unit to find it
+        by -- and the report must say so rather than `removed`."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        fragment = tmp_path / ".config" / "systemd" / "user" / _UNIT
+        fragment.parent.mkdir(parents=True)
+        fragment.write_text("[Unit]\n", encoding="utf-8")
+        run = _fake_systemctl(
+            system=None,
+            user=_RUNNING,
+            user_fragment=str(fragment),
+            overrides={"stop": self._REFUSED_STOP},
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", return_value=MagicMock(message="")):
+            report = svc_linux.uninstall()
+            rc = controller.uninstall_service()
+
+        assert fragment.exists(), "the unit file of a unit that did not stop was deleted"
+        assert report.user.startswith("left in place ("), report.user
+        assert f"`systemctl --user stop {_UNIT}` failed" in report.user
+        assert "configured to refuse manual start/stop" in report.user
+        assert "the unit file was not removed" in report.user
+        assert report.system == "not installed"
+        assert report.unfinished == frozenset({"user"})
+        assert report.incomplete is True
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+        assert not any("disable" in c for c in run.calls), run.calls
+        assert not any(c[-1:] == ["daemon-reload"] for c in run.calls), run.calls
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "No kirocrew service was removed." in out
+        assert "   system scope: not installed" in out
+        assert "   ⚠️ user scope: left in place (" in out
+
+    def test_a_refused_user_disable_after_a_successful_stop_still_keeps_the_file(
+        self, tmp_path
+    ):
+        from kiro_crew.service import linux as svc_linux
+
+        fragment = tmp_path / "user" / _UNIT
+        fragment.parent.mkdir()
+        fragment.write_text("", encoding="utf-8")
+        refused = subprocess.CompletedProcess([], 1, "", "Failed to disable unit: Access denied\n")
+        run = _fake_systemctl(
+            system=None, user=_RUNNING, user_fragment=str(fragment), overrides={"disable": refused}
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert fragment.exists()
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+        assert ["systemctl", "--user", "disable", _UNIT] in run.calls
+        assert f"`systemctl --user disable {_UNIT}` failed: Failed to disable unit" in report.user
+        assert report.unfinished == frozenset({"user"})
+
+    def test_a_refused_system_stop_leaves_the_system_unit_and_still_reports_the_user_scope(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The same guard on the sibling branch: a system unit whose sudo'd stop the
+        manager refuses is not `rm -f`'d, the warning lands on the SYSTEM line, and
+        the user scope is still queried and reported."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        run = _fake_systemctl(system=_RUNNING, user=None, overrides={"stop": self._REFUSED_STOP})
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", return_value=MagicMock(message="")):
+            report = svc_linux.uninstall()
+            rc = controller.uninstall_service()
+
+        assert ["sudo", "systemctl", "stop", _UNIT] in run.calls
+        assert not any("rm" in c for c in run.calls), run.calls
+        assert not any("disable" in c for c in run.calls), run.calls
+        assert report.system.startswith("left in place (")
+        assert f"`sudo systemctl stop {_UNIT}` failed" in report.system
+        assert report.user == "not installed"
+        assert any(c[:3] == ["systemctl", "--user", "show"] for c in run.calls), run.calls
+        assert report.unfinished == frozenset({"system"})
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "   ⚠️ system scope: left in place (" in out
+        assert "   user scope: not installed" in out
+        assert "⚠️ user scope" not in out
+
+    def test_no_sudo_reports_the_system_unit_and_still_removes_the_user_unit(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """The SELinux remedy's layout on a host without sudo: a stale system unit
+        file beside the account's own running user unit. The system scope cannot
+        be touched without root, but that must not abort the call before the user
+        unit -- the one this account CAN remove -- is torn down."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux.sys, "platform", "linux")
+        monkeypatch.setattr(svc_linux.shutil, "which", lambda name: None)
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        fragment = tmp_path / "user" / _UNIT
+        fragment.parent.mkdir()
+        fragment.write_text("", encoding="utf-8")
+        run = _fake_systemctl(system=_DEAD, user=_RUNNING, user_fragment=str(fragment))
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", return_value=MagicMock(message="")):
+            rc = controller.uninstall_service()
+
+        assert not fragment.exists(), "the reachable user unit was not removed"
+        assert system_unit.exists()
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+        assert ["systemctl", "--user", "disable", _UNIT] in run.calls
+        assert not any(c[0] == "sudo" for c in run.calls), run.calls
+        assert rc == 1
+        out = capsys.readouterr().out
+        assert "✅ kirocrew service stopped and removed." in out
+        assert "   ⚠️ system scope: left in place (privilege unavailable: " in out
+        assert "'sudo' was not found" in out
+        assert f"   user scope: removed ({fragment})" in out
+
+    def test_a_stale_system_unit_file_is_removed_when_the_manager_is_unreachable(
+        self, tmp_path, monkeypatch
+    ):
+        """A container where systemd is not PID 1: `install()` writes the unit file
+        and its daemon-reload raises, leaving the file behind; every later
+        `systemctl` verb fails the same way and `/run/systemd/system` does not
+        exist. No manager runs on such a host, so nothing can be running under the
+        unit -- the file is removed, as the base did."""
+        from kiro_crew.service import linux as svc_linux
+
+        monkeypatch.setattr(svc_linux, "_SYSTEMD_BOOTED_DIR", tmp_path / "run-systemd-absent")
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        inner = _fake_systemctl(system=None, user=None)
+        no_pid1 = "System has not been booted with systemd as init system (PID 1). Can't operate."
+
+        def run(argv, *a, **kw):
+            res = inner(argv, *a, **kw)
+            if "systemctl" in argv:
+                return subprocess.CompletedProcess(list(argv), 1, "", no_pid1 + "\n")
+            return res
+
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.system == f"removed ({system_unit})"
+        assert any(c[:3] == ["sudo", "rm", "-f"] for c in inner.calls), inner.calls
+        assert not any("stop" in c or "disable" in c for c in inner.calls), inner.calls
+        assert report.user.startswith("not reachable from this shell")
+        assert no_pid1 in report.user
+        assert report.unfinished == frozenset()
+
+    def test_an_unreachable_manager_on_a_systemd_host_keeps_the_system_unit_file(
+        self, tmp_path, monkeypatch
+    ):
+        """The opposite case: `/run/systemd/system` exists, so a system manager IS
+        running, but this shell cannot reach it (a sandbox: `Permission denied`).
+        Whether the unit is running cannot be confirmed from here, so nothing is
+        removed and the line says so."""
+        from kiro_crew.service import linux as svc_linux
+
+        booted = tmp_path / "run-systemd"
+        booted.mkdir()
+        monkeypatch.setattr(svc_linux, "_SYSTEMD_BOOTED_DIR", booted)
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        inner = _fake_systemctl(system=None, user=None)
+        denied = "Failed to connect to bus: Permission denied"
+
+        def run(argv, *a, **kw):
+            res = inner(argv, *a, **kw)
+            if "systemctl" in argv:
+                return subprocess.CompletedProcess(list(argv), 1, "", denied + "\n")
+            return res
+
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert system_unit.exists()
+        assert not any("rm" in c for c in inner.calls), inner.calls
+        assert report.system.startswith("left in place (the system manager is not reachable")
+        assert denied in report.system
+        assert "cannot be confirmed" in report.system
+        assert report.unfinished == frozenset({"system"})
+
+    def test_a_running_masked_system_unit_is_refused_whole(self, tmp_path, monkeypatch, capsys):
+        """`systemctl mask` leaves a running unit running: `show` answers
+        `LoadState=masked ActiveState=active`. Skipping the stop because the unit
+        is not `loaded` and then unlinking would leave the gateway running with no
+        unit to find it by -- so nothing is stopped, disabled or unlinked, and the
+        operator is told the step that makes it removable."""
+        from kiro_crew.service import controller
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        run = _fake_systemctl(system=_RUNNING, user=None, system_load="masked")
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.controller.current_platform", return_value=Platform.SYSTEMD
+        ), patch.object(svc_linux, "remove_apparmor_profile", return_value=MagicMock(message="")):
+            report = svc_linux.uninstall()
+            rc = controller.uninstall_service()
+
+        assert system_unit.exists(), "a running masked unit's file was deleted"
+        assert not any("rm" in c or "stop" in c or "disable" in c for c in run.calls), run.calls
+        assert report.system == (
+            "left in place (an active unit whose load state is masked: unmask and stop it "
+            "first, then run `kirocrew service uninstall` again)"
+        )
+        assert report.unfinished == frozenset({"system"})
+        assert rc == 1
+        assert "⚠️ system scope: left in place (an active unit whose load state is masked" in (
+            capsys.readouterr().out
+        )
+
+    def test_a_running_masked_user_unit_is_refused_whole(self, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(
+            system=None, user=_RUNNING, user_fragment="/dev/null", user_load="masked"
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.linux.os.unlink"
+        ) as unlink:
+            report = svc_linux.uninstall()
+
+        unlink.assert_not_called()
+        assert self._user_calls(run) == [c for c in run.calls if "show" in c], run.calls
+        assert report.user.startswith("left in place (an active unit whose load state is masked")
+        assert "unmask and stop it first" in report.user
+        assert report.unfinished == frozenset({"user"})
+
+    def test_a_running_unit_whose_file_was_removed_under_it_is_not_reported_not_installed(
+        self,
+    ):
+        """A user unit deleted and daemon-reloaded while running answers
+        `LoadState=not-found ActiveState=active`: that is a running gateway, not
+        "nothing here", and `disable` / unlink have nothing to act on."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=_RUNNING, user_load="not-found")
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.user.startswith("left in place (an active unit whose load state is not-found")
+        assert "stop it first" in report.user
+        assert report.unfinished == frozenset({"user"})
+        assert not any("stop" in c for c in run.calls), run.calls
+
+    def test_a_system_scope_alias_is_never_stopped_or_disabled_on_our_name(
+        self, tmp_path, monkeypatch
+    ):
+        """`stop` / `disable` on an alias act on the unit it resolves to; the
+        system scope refuses the alias like the user scope does."""
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        run = _fake_systemctl(system=_RUNNING, user=None, system_id="shared.service")
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert system_unit.exists()
+        assert not any("rm" in c or "stop" in c or "disable" in c for c in run.calls), run.calls
+        assert report.system == (
+            f"left in place ({_UNIT} is an alias of shared.service; manage that unit)"
+        )
+        assert report.unfinished == frozenset({"system"})
+
+    def test_a_stop_that_returns_0_but_leaves_the_unit_running_is_not_followed_by_unlink(
+        self, tmp_path
+    ):
+        """The unlink rests on the manager's ActiveState after the stop, not on
+        the stop verb's exit code alone."""
+        from kiro_crew.service import linux as svc_linux
+
+        fragment = tmp_path / "user" / _UNIT
+        fragment.parent.mkdir()
+        fragment.write_text("", encoding="utf-8")
+        run = _fake_systemctl(
+            system=None, user=_RUNNING, user_fragment=str(fragment), stop_is_ignored=True
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert fragment.exists()
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls
+        assert not any(c[-1:] == ["daemon-reload"] for c in run.calls), run.calls
+        assert report.user.startswith("left in place (still active (running) after")
+        assert "returned 0" in report.user
+        assert report.unfinished == frozenset({"user"})
+
+    def test_uninstall_reads_the_state_back_after_the_stop_before_unlinking(self, tmp_path):
+        """Order per scope: stop -> disable -> verify inactive (a second `show`) ->
+        unlink -> daemon-reload."""
+        from kiro_crew.service import linux as svc_linux
+
+        fragment = tmp_path / "user" / _UNIT
+        fragment.parent.mkdir()
+        fragment.write_text("", encoding="utf-8")
+        run = _fake_systemctl(system=None, user=_RUNNING, user_fragment=str(fragment))
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.user == f"removed ({fragment})"
+        verbs = [next(t for t in c if t in ("show", "stop", "disable", "daemon-reload"))
+                 for c in run.calls if "--user" in c]
+        assert verbs == ["show", "stop", "disable", "show", "daemon-reload"], verbs
+
+    def test_a_crash_looping_unit_in_auto_restart_is_still_stopped_and_counted(self):
+        """The reporter's `203/EXEC` loop spends nearly all its time in
+        `activating (auto-restart)`, which `is-active` answers non-zero for. The
+        scope selector reads ActiveState from `show`, so `kirocrew stop` reaches
+        the loop, `is_active()` counts it and the logs command prefers its journal."""
+        from kiro_crew.service import linux as svc_linux
+
+        looping = {"ActiveState": "activating", "SubState": "auto-restart"}
+        run = _fake_systemctl(system=None, user=looping)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+            assert svc_linux.is_active() is True
+            assert svc_linux.user_unit_active() is True
+            svc_linux.stop()
+
+        assert ["systemctl", "--user", "stop", _UNIT] in run.calls, run.calls
+        assert not any("is-active" in c for c in run.calls), run.calls
+        assert "user scope: activating (auto-restart)" in out
+
+    def test_restart_never_starts_a_stopped_unit_in_the_other_scope(self):
+        """Selecting on "running" rather than "installed": a stopped system unit
+        left beside the running user unit is not restarted (started) on the side."""
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=_DEAD, user=_RUNNING)
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            assert svc_linux.restart() is True
+
+        assert ["systemctl", "--user", "restart", _UNIT] in run.calls, run.calls
+        assert not any(c[:3] == ["sudo", "systemctl", "restart"] for c in run.calls), run.calls
+
+    def test_a_system_unit_file_the_manager_has_not_loaded_is_removed_without_a_stop(
+        self, tmp_path, monkeypatch
+    ):
+        """A file dropped without a daemon-reload: the manager answers
+        `LoadState=not-found`, a `stop` would only fail (exit 5, not loaded), and
+        nothing runs under it -- removed, no stop/disable issued."""
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        not_loaded = subprocess.CompletedProcess([], 5, "", f"Failed to stop {_UNIT}: Unit {_UNIT} not loaded.\n")
+        run = _fake_systemctl(system=None, user=None, overrides={"stop": not_loaded})
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.system == f"removed ({system_unit})"
+        assert any(c[:3] == ["sudo", "rm", "-f"] for c in run.calls), run.calls
+        assert not any("stop" in c or "disable" in c for c in run.calls), run.calls
+        assert ["sudo", "systemctl", "daemon-reload"] in run.calls
+        assert report.unfinished == frozenset()
+
+    def test_a_system_unit_file_rm_that_does_not_take_is_reported_not_claimed_removed(
+        self, tmp_path, monkeypatch
+    ):
+        from kiro_crew.service import linux as svc_linux
+
+        system_unit = tmp_path / "etc" / _UNIT
+        system_unit.parent.mkdir()
+        system_unit.write_text("", encoding="utf-8")
+        monkeypatch.setattr(svc_linux, "UNIT_PATH", system_unit)
+        inner = _fake_systemctl(system=_DEAD, user=None)
+
+        def run(argv, *a, **kw):
+            res = inner(argv, *a, **kw)
+            if "rm" in argv:
+                return subprocess.CompletedProcess(
+                    list(argv), 1, "", f"rm: cannot remove '{system_unit}': Read-only file system\n"
+                )
+            return res
+
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert report.system.startswith("stopped and disabled, but its unit file")
+        assert "Read-only file system" in report.system
+        assert "sudo systemctl daemon-reload" in report.system
+        assert report.unfinished == frozenset({"system"})
+        assert not any(c[-1:] == ["daemon-reload"] for c in inner.calls), inner.calls
+
+    def test_uninstall_never_deletes_the_target_of_an_alias(self, tmp_path):
+        """`systemctl show kirocrew.service` on an ALIAS answers for the canonical
+        unit -- `Id=shared.service`, that unit's `FragmentPath` -- so following
+        the path would delete someone else's unit file. Nothing in that scope is
+        stopped, disabled or unlinked; the report names the alias."""
+        from kiro_crew.service import linux as svc_linux
+
+        shared = tmp_path / "shared.service"
+        shared.write_text("[Unit]\n", encoding="utf-8")
+        run = _fake_systemctl(
+            system=None, user=_RUNNING, user_fragment=str(shared), user_id="shared.service"
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert shared.exists()
+        assert report.user.startswith("left in place")
+        assert "shared.service" in report.user
+        assert self._user_calls(run) == [c for c in run.calls if "show" in c], run.calls
+
+    def test_uninstall_leaves_a_masked_user_unit_alone(self, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(
+            system=None, user=_DEAD, user_fragment="/dev/null", user_load="masked"
+        )
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run), patch(
+            "kiro_crew.service.linux.os.unlink"
+        ) as unlink:
+            report = svc_linux.uninstall()
+
+        unlink.assert_not_called()
+        assert report.user.startswith("left in place")
+        assert "masked" in report.user
+        assert not any("stop" in c or "disable" in c for c in run.calls), run.calls
+
+    def test_uninstall_only_unlinks_a_file_named_after_the_unit(self, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        other = tmp_path / "gateway.service"
+        other.write_text("", encoding="utf-8")
+        run = _fake_systemctl(system=None, user=_RUNNING, user_fragment=str(other))
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            report = svc_linux.uninstall()
+
+        assert other.exists()
+        assert report.user.startswith("left in place")
+
+    def test_status_names_an_alias_for_what_it_is(self, tmp_path):
+        from kiro_crew.service import linux as svc_linux
+
+        run = _fake_systemctl(system=None, user=_RUNNING, user_id="shared.service")
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            out = svc_linux.status()
+
+        assert "user scope: active (running), an alias of shared.service" in out
+
+    def test_restart_reaches_every_active_scope_even_after_a_refusal(self):
+        """Two scopes running the unit and the first restart refused: the second
+        scope's restart must still be issued, and the result is still False."""
+        from kiro_crew.service import linux as svc_linux
+
+        refused = subprocess.CompletedProcess([], 1, "", "Interactive authentication required")
+        run = _fake_systemctl(system=_RUNNING, user=_RUNNING, overrides={"restart": refused})
+        with patch("kiro_crew.service.linux.subprocess.run", side_effect=run):
+            assert svc_linux.restart() is False
+
+        assert ["sudo", "systemctl", "restart", _UNIT] in run.calls, run.calls
+        assert ["systemctl", "--user", "restart", _UNIT] in run.calls, run.calls
+
+    def test_the_selinux_remedy_no_longer_disowns_the_user_unit(self, monkeypatch):
+        from kiro_crew.service import linux as svc_linux
+
+        with patch(
+            "kiro_crew.service.common.shutil.which",
+            return_value="/home/tester/.local/bin/kirocrew",
+        ), patch.object(svc_linux, "_home_for_user", return_value="/home/tester"):
+            remedy = svc_linux._user_scope_remedy()
+
+        assert "will not see" not in remedy
+        assert "only looks at the system unit" not in remedy
+        assert "kirocrew service status|uninstall" in remedy
 
 
 class TestMacOSControlPaths:
@@ -3002,7 +3937,11 @@ class TestAppArmorNeverFailsTheInstall:
             return ProfileOutcome(True, "AppArmor profile removed from /etc/apparmor.d/x")
 
         monkeypatch.setattr(controller, "current_platform", lambda: Platform.SYSTEMD)
-        monkeypatch.setattr(controller.linux, "uninstall", lambda: None)
+        monkeypatch.setattr(
+            controller.linux,
+            "uninstall",
+            lambda: controller.linux.UninstallReport("removed (/etc/x.service)", "not installed"),
+        )
         monkeypatch.setattr(controller.linux, "remove_apparmor_profile", remove)
 
         rc = controller.uninstall_service()

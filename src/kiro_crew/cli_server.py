@@ -2694,13 +2694,29 @@ def _sandbox_cmd(args: argparse.Namespace) -> int:
     return 2
 
 
+# What journalctl prints on stdout (exit 0) when no entry matches — a notice,
+# not a row. Suppressed by `--quiet`, together with the access hint below.
+_JOURNAL_NO_ENTRIES = "-- No entries --"
+# The one line that says the SYSTEM journal is not readable by this user: it is
+# printed to stderr by every journalctl since the hint exists, whatever the
+# groups it goes on to name, and only when the process is not `--quiet`.
+_JOURNAL_ACCESS_HINT = "not seeing messages from other users"
+
+
+def _journal_access_hint(stderr: str) -> bool:
+    """Whether a journalctl probe's stderr carries the system-journal access hint."""
+    return _JOURNAL_ACCESS_HINT in (stderr or "").casefold()
+
+
 def _logs_cmd(args: argparse.Namespace) -> None:
     """Tail gateway logs from the most appropriate source.
 
     Order of preference:
-      1. systemd journal (if the system service is installed on Linux)
-      2. launchd stdout file (macOS)
-      3. ``~/.kiro/crew/gateway.log`` (foreground gateway)
+      1. the USER journal (``journalctl --user``) when the per-user unit — the
+         SELinux remedy's gateway — is the one running, or the only one installed
+      2. systemd journal (if the system service is installed on Linux)
+      3. launchd stdout file (macOS)
+      4. ``~/.kiro/crew/gateway.log`` (foreground gateway)
     """
     follow = bool(getattr(args, "follow", False))
     lines = int(getattr(args, "lines", 100) or 100)
@@ -2717,16 +2733,25 @@ def _logs_cmd(args: argparse.Namespace) -> None:
         resources=f"follow={follow} lines={lines} platform={plat.value}",
     )
 
-    if plat == Platform.SYSTEMD and svc_linux.UNIT_PATH.exists():
-        # Try journalctl unprivileged first — it works if the user is in
-        # the `systemd-journal` or `adm` group. Only fall back to sudo
-        # journalctl if the unprivileged probe returns no rows. Without
-        # this fall-through, `kirocrew logs` would hang on hosts without
-        # passwordless sudo, which is a surprising failure mode for a
-        # read-only log-viewer.
-        base = ["journalctl", "--no-pager", "-u", unit, "-n", str(lines)]
+    system_unit = plat == Platform.SYSTEMD and svc_linux.UNIT_PATH.exists()
+    user_unit = plat == Platform.SYSTEMD and svc_linux.user_unit_installed()
+    # A gateway running as the per-user unit (what the SELinux refusal hands the
+    # operator) logs to the account's OWN journal, which the system-scope arm
+    # below never opens — and that arm always execs or exits once the system unit
+    # file exists, so on a host where a stopped system unit was left beside the
+    # running user unit it would tail the dead unit's journal. The user journal
+    # therefore goes first whenever its unit is the running one (or the only
+    # one). `journalctl --user` reads it without privilege, so there is no sudo
+    # rung here: an empty probe means the user journal holds nothing readable
+    # (no persistent journal, or none for this unit yet), and the next source is
+    # the honest fallback rather than a password prompt. `--quiet` matters: a
+    # journal with no matching entries prints `-- No entries --` on STDOUT with
+    # exit 0 (systemd 252), which would pass the emptiness check and exec a tail
+    # of nothing; quiet suppresses that notice so an empty journal reads empty.
+    if user_unit and (not system_unit or svc_linux.user_unit_active()):
+        base = ["journalctl", "--user", "--no-pager", "-u", unit, "-n", str(lines)]
         probe = subprocess.run(
-            ["journalctl", "-u", unit, "-n", "1", "--no-pager"],
+            ["journalctl", "--user", "--quiet", "-u", unit, "-n", "1", "--no-pager"],
             capture_output=True,
             check=False,
             **UTF8_TEXT,
@@ -2735,25 +2760,59 @@ def _logs_cmd(args: argparse.Namespace) -> None:
             if follow:
                 base.append("-f")
             os.execvp("journalctl", base)
-        # Refuse to invoke sudo without a TTY: in non-interactive
-        # contexts (cron, piped scripts, systemd ExecStartPre) the sudo
-        # password prompt would block forever with no way to cancel.
-        if not sys.stdin.isatty():
-            print(
-                "👻 Insufficient permissions to read the journal without sudo, "
-                "and stdin is not a TTY so sudo can't prompt.\n"
-                "   Add your user to the `systemd-journal` or `adm` group, or run:\n"
-                f"   sudo journalctl -u {unit} -f",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-        # Fall back to sudo journalctl. `--no-pager` prevents the pager
-        # (`less`) from taking over after exec, which behaves badly in
-        # piped/non-interactive contexts.
-        sudo_cmd = ["sudo", *base]
-        if follow:
-            sudo_cmd.append("-f")
-        os.execvp("sudo", sudo_cmd)
+
+    if system_unit:
+        # Try journalctl unprivileged first — it works if the user is in
+        # the `systemd-journal` or `adm` group. Only fall back to sudo
+        # journalctl on a PERMISSION signal, never on emptiness alone. Without
+        # this fall-through, `kirocrew logs` would hang on hosts without
+        # passwordless sudo, which is a surprising failure mode for a
+        # read-only log-viewer.
+        #
+        # The probe runs WITHOUT `--quiet`, on purpose: a user who cannot read
+        # the system journal gets exit 0 and `-- No entries --` on stdout with
+        # journalctl's access hint on stderr ("You are currently not seeing
+        # messages from other users and the system … Pass -q to turn off this
+        # notice."), and `-q` suppresses exactly that hint — with it, an
+        # unprivileged probe and a readable-but-empty journal (`Storage=none`,
+        # a vacuumed or volatile journal) are byte-identical: exit 0, nothing on
+        # either stream. So: rows on stdout -> exec unprivileged; no rows and no
+        # hint -> the journal is readable and empty, fall through to the next
+        # source; the hint, or a failed probe -> the sudo rung. `-- No entries --`
+        # itself is a notice, not a row.
+        base = ["journalctl", "--no-pager", "-u", unit, "-n", str(lines)]
+        probe = subprocess.run(
+            ["journalctl", "-u", unit, "-n", "1", "--no-pager"],
+            capture_output=True,
+            check=False,
+            **UTF8_TEXT,
+        )
+        rows = probe.stdout.strip()
+        readable = probe.returncode == 0 and not _journal_access_hint(probe.stderr)
+        if readable and rows and rows != _JOURNAL_NO_ENTRIES:
+            if follow:
+                base.append("-f")
+            os.execvp("journalctl", base)
+        if not readable:
+            # Refuse to invoke sudo without a TTY: in non-interactive
+            # contexts (cron, piped scripts, systemd ExecStartPre) the sudo
+            # password prompt would block forever with no way to cancel.
+            if not sys.stdin.isatty():
+                print(
+                    "👻 Insufficient permissions to read the journal without sudo, "
+                    "and stdin is not a TTY so sudo can't prompt.\n"
+                    "   Add your user to the `systemd-journal` or `adm` group, or run:\n"
+                    f"   sudo journalctl -u {unit} -f",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            # Fall back to sudo journalctl. `--no-pager` prevents the pager
+            # (`less`) from taking over after exec, which behaves badly in
+            # piped/non-interactive contexts.
+            sudo_cmd = ["sudo", *base]
+            if follow:
+                sudo_cmd.append("-f")
+            os.execvp("sudo", sudo_cmd)
 
     # Both guards mirror checks the systemd arm above already makes on its own
     # branch. current_platform() returns LAUNCHD for any macOS host whether or

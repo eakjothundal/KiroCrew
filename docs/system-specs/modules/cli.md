@@ -236,9 +236,9 @@ choice blob makes the usage line unreadable.
 | `kirocrew stop` | Stop a running gateway (service-aware: stops the systemd/launchd service if active, otherwise terminates the gateway found by a cross-platform port lookup — lsof on POSIX, netstat on Windows). Pass `--port N` to bypass the service short-circuit and target a specific gateway. |
 | `kirocrew restart` | Restart a running gateway (service-aware: restarts the systemd/launchd service if active, otherwise terminates the foreground gateway and respawns it detached). Pass `--port N` to bypass the service short-circuit and target a specific gateway. |
 | `kirocrew service install` | Install gateway as a system-level systemd service (Linux, requires sudo for `tee` + `systemctl` only) or launchd LaunchAgent (macOS, no sudo). Auto-restarts on crash, auto-starts on boot. |
-| `kirocrew service uninstall` | Stop and remove the systemd unit / launchd plist. |
-| `kirocrew service status` | Show service status (`systemctl status` or `launchctl list`). No sudo required. |
-| `kirocrew logs` | Tail gateway logs from the systemd journal, launchd stdout file, or `~/.kiro/crew/gateway.log`. Hosts without systemd/launchd, including Windows, read the UTF-8 fallback file in Python without requiring `tail`. Read failures exit with file-access/retry guidance instead of an exception traceback. |
+| `kirocrew service uninstall` | Stop and remove the systemd unit / launchd plist. On Linux this covers both systemd scopes — the system unit (sudo) and a per-user unit (`systemctl --user`, never sudo) — and prints one line per scope saying `removed (<unit file>)`, `not installed`, `left in place (…)` (an alias, a mask or an unparseable unit is never acted on), or `not reachable from this shell (…)`; nothing installed in either scope exits 0 with that report. In either scope the order is stop → disable → verify inactive → unlink → `daemon-reload`; a step the manager refuses (or a unit still running after `stop` returned 0) leaves the file in place and the line reads `left in place (\`… stop kirocrew.service\` failed: …; the unit file was not removed)`; a system unit on a host without `sudo` reads `left in place (privilege unavailable: …)` while the user unit is still torn down. An alias, and a unit that is running under any load state but `loaded` (a runtime mask, an unparseable edit, a file removed under it), are refused whole before any verb: `left in place (an active unit whose load state is masked: unmask and stop it first, then run \`kirocrew service uninstall\` again)`. A system unit file the manager does not have loaded and that is not running (a file dropped without a `daemon-reload`, an inactive mask, an unparseable unit) is removed without those verbs; a system manager the shell cannot reach removes the file only on a host not booted with systemd (`/run/systemd/system` absent), and otherwise reads `left in place (the system manager is not reachable from this shell: …)`. Those `left in place` lines (exit 1 whenever a unit may still be running), or a unit file that cannot be removed after a successful stop, are marked ⚠️ on their own scope line, the AppArmor profile is still removed, and the exit code is 1. |
+| `kirocrew service status` | Show service status. No sudo required. On Linux it names both scopes: `system scope: …` then `user scope: …`, each `not installed`, `not reachable from this shell (…)`, or the unit's `ActiveState (SubState)`, followed by the `systemctl status` block for every scope that has a unit — a scope with no unit never reads `inactive (dead)`. Exit 0 when the unit is running in either scope — any `ActiveState` but `inactive` / `failed`, so a crash-looping unit in `activating (auto-restart)` counts. macOS: `launchctl list`. |
+| `kirocrew logs` | Tail gateway logs from the systemd journal (the user journal, `journalctl --user`, when the gateway is the per-user unit), launchd stdout file, or `~/.kiro/crew/gateway.log`. Hosts without systemd/launchd, including Windows, read the UTF-8 fallback file in Python without requiring `tail`. Read failures exit with file-access/retry guidance instead of an exception traceback. |
 | `kirocrew logs -f` | Follow logs live. The Python fallback reopens the log by name on each poll, permits Windows rename-based rotation even during reads, streams appended UTF-8 text, and stops on Ctrl+C. A replacement file or detected truncation resets the read offset; a temporary missing path during rotation is retried on the next poll. Rotated backup files are not replayed. |
 | `kirocrew cloud launch/list/status/connect/tunnel/login/logout/stop/start/destroy/iam-policy/iam-boundary/doctor` | Provision, connect to, and manage a Kiro Crew EC2 instance in the user's AWS account. `iam-boundary` is the one-time admin step that pre-creates the immutable instance permissions boundary — see [cloud.md](cloud.md). |
 | `kirocrew security events` | Show recent SEL audit events (`-n N` for count) |
@@ -1413,6 +1413,82 @@ on crash, and starts on boot. Implemented in `src/kiro_crew/service/`.
   - Boot survival via `WantedBy=multi-user.target` (no linger needed —
     that's a user-service concept; this is system-level).
   - Crash-loop safety: `StartLimitBurst=3 StartLimitIntervalSec=300`.
+  - **Two scopes, both visible.** `install` writes the system unit only, but
+    the SELinux refusal hands the operator a per-user unit
+    (`render_unit(user_scope=True)`, managed with `systemctl --user`), so
+    every OTHER verb accounts for both scopes and names the one it reports on:
+    `status` prints `system scope: …` then `user scope: …`; `is_active()` is
+    true when either scope RUNS the unit — any `ActiveState` but `inactive` /
+    `failed`, so a unit crash-looping through `activating (auto-restart)`
+    counts — and `stop()` / `restart()` act on each scope that does, selected
+    by the same `systemctl show` the status verbs read rather than an
+    `is-active` probe, which answers non-zero for `activating` and would let
+    `kirocrew stop` issue nothing at a flapping unit (`kirocrew stop` /
+    `kirocrew restart` therefore reach a user-scope gateway through its own
+    manager, with no sudo; a stopped unit in the other scope is never started
+    on the side, which selecting on "installed" would do); `uninstall()`
+    tears down the system unit under sudo and the user unit through
+    `systemctl --user`, and returns an `UninstallReport`
+    naming what each scope got. The order in either scope is stop → disable
+    → verify inactive (a second `show`) → unlink the file systemd reports as
+    `FragmentPath` (the literal `/etc/systemd/system` path in the system
+    scope) → `daemon-reload`: a step the manager refuses
+    (`RefuseManualStop=yes`, a bus that went away mid-run, a declined
+    sudo), or a unit still running after `stop` returned 0, ends that
+    scope's teardown before anything is unlinked, its line
+    reads `left in place (\`… stop kirocrew.service\` failed: …; the unit
+    file was not removed)`, and the controller marks that line and exits 1 —
+    deleting the file would leave a unit that is still loaded, possibly
+    still running, with no unit to find it by while the report read
+    `removed`. Two shapes are refused WHOLE, before any verb: an alias (in
+    either scope — `show <name>` answers for the unit the name resolves to,
+    so `stop` / `disable` / unlink on our name would act on that unit) and a
+    unit that is RUNNING under any load state but `loaded` — masked at
+    runtime (`systemctl mask` leaves a running unit running and reports its
+    fragment as the mask), edited into an unparseable state, or `not-found`
+    with its file removed under it — reported as `left in place (an active
+    unit whose load state is masked: unmask and stop it first, then run
+    \`kirocrew service uninstall\` again)` and marked unfinished. A system
+    unit file the manager answers for but does not have loaded and that is
+    NOT running (a file dropped without a `daemon-reload`, an inactive mask,
+    an unparseable unit) runs nothing and is removed outright. A system
+    manager the shell cannot reach is decided by `sd_booted(3)`'s test,
+    `/run/systemd/system`: absent, no manager runs on this host (a container
+    where systemd is not PID 1, where `install()` leaves the file behind when
+    its `daemon-reload` fails) and the stale file is removed; present, the
+    unit may well be running and the line reads `left in place (the system
+    manager is not reachable from this shell: …)`. A host without `sudo` does
+    not abort the call: the system line reads `left in place (privilege
+    unavailable: …)` and the user scope is still torn down. A unit file that
+    cannot be removed after a successful stop is
+    reported the same way on its own scope's line. The user-scope teardown
+    runs only for a
+    LOADED unit whose canonical `Id` is `kirocrew.service` and whose fragment
+    is named after it: a mask
+    `/dev/null` and an unparseable unit are the operator's to inspect — both
+    are reported as `left in place (…)` and nothing in that scope is
+    stopped, disabled or deleted. Load state comes from `systemctl show -p
+    Id -p LoadState -p ActiveState -p SubState -p FragmentPath` (parsed as
+    `Key=value`, which systemd 219 supports — `--value` does not exist there),
+    because `is-active` answers `inactive` both for a stopped unit and for a
+    scope with no unit, which is what makes a running user-scope gateway read
+    as `inactive (dead)` in a report that asks the system scope alone. Every
+    `systemctl --user` the module spawns runs with
+    `service.common.systemctl_user_env()`, the one resolver the pod runtime's
+    `systemctl --user` spawns also use: it backfills `XDG_RUNTIME_DIR` and,
+    when the bus socket exists, `DBUS_SESSION_BUS_ADDRESS` from the account's
+    runtime directory (never overriding a value the caller set), so a shell
+    descended from a system unit — the gateway's own — reaches the account's
+    manager and a `not reachable` reading is a host fact, not a
+    missing-variable artifact. A user
+    scope this process cannot
+    see is reported as `not reachable from this shell (<reason>)`, never as
+    inactive, and `uninstall` leaves it alone: a root process whose
+    `SUDO_USER` names a human is decided in-process without spawning
+    (`systemctl --user` there would answer for root's manager, not the
+    human's), and any other failure — no session bus, a stripped environment,
+    a sandbox — is systemd's own non-zero exit with no `LoadState` printed,
+    reported with its diagnostic and never classified by stderr text.
   - Logs are read from the journal: `sudo journalctl -u kirocrew -f`,
     or unprivileged if the user is in `systemd-journal` / `adm`.
 - **macOS** (`current_platform() == LAUNCHD`):
@@ -1433,15 +1509,37 @@ immediately restart the gateway under us.
 `kirocrew logs [-n LINES] [-f]` tails the gateway log from whichever
 source is most appropriate:
 
-1. systemd journal if the system service is installed on Linux. Tries
-   unprivileged `journalctl` first; falls back to `sudo journalctl`
-   only if the unprivileged probe returns no rows.
-2. launchd stdout file if a plist exists on macOS and that file is
+1. the USER journal (`journalctl --user -u kirocrew.service`) when the
+   calling account's own manager has the unit loaded
+   (`service.linux.user_unit_installed()`) and it is either the only unit or
+   the one running (`user_unit_active()`, asked only when a system unit file
+   also exists — a stopped system unit left by an earlier install must not
+   win over the per-user gateway that replaced it). Read without privilege;
+   there is no sudo rung, because the user journal never needs one, so an
+   empty probe falls through to the next source. The user probe runs
+   `journalctl --user … --quiet -n 1`: a journal with no matching entries
+   prints `-- No entries --` on stdout with exit 0 (systemd 252), which is
+   not a row and must not exec a tail of nothing — quiet suppresses the
+   notice so an empty journal reads empty.
+2. systemd journal if the system service is installed on Linux. Tries
+   unprivileged `journalctl` first, and takes the `sudo journalctl` rung
+   only on a PERMISSION signal, never on emptiness alone. The probe is
+   deliberately NOT quiet: a user outside the `systemd-journal` / `adm`
+   groups gets exit 0, `-- No entries --` on stdout and journalctl's access
+   hint on stderr (`You are currently not seeing messages from other users
+   and the system … Pass -q to turn off this notice.`), and `-q` silences
+   exactly that hint — with it, an unreadable journal and a readable but
+   empty one (`Storage=none`, a vacuumed or volatile journal) are
+   byte-identical. So: rows on stdout → exec unprivileged `journalctl`; no
+   rows and no hint → readable and empty, fall through to the next source;
+   the hint, or a failed probe → the sudo rung (a TTY prompt, or the
+   "stdin is not a TTY" refusal). `-- No entries --` is a notice, not a row.
+3. launchd stdout file if a plist exists on macOS and that file is
    non-empty. Both conditions matter: the platform probe reports launchd
    on any macOS host, and an install that never started the agent leaves
    a 0-byte log behind, so either check alone would capture the command
    and tail nothing.
-3. `~/.kiro/crew/gateway.log` for foreground gateways
+4. `~/.kiro/crew/gateway.log` for foreground gateways
 
 Uses `os.execvp` so signals (Ctrl+C) propagate naturally to the
 underlying `journalctl`/`tail` process.

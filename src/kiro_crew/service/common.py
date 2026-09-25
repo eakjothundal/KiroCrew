@@ -44,6 +44,51 @@ def systemd_quote(value: str) -> str:
     return f'"{escaped}"'
 
 
+def session_runtime_dir() -> str:
+    """The per-user runtime directory ``systemctl --user`` resolves against.
+
+    ``XDG_RUNTIME_DIR`` when the caller has one, else systemd's conventional
+    ``/run/user/<uid>``. ``os.getuid`` is absent on Windows; every caller is
+    Linux-only at runtime, but the ``getattr`` keeps this module importable there.
+    """
+    explicit = os.environ.get("XDG_RUNTIME_DIR")
+    if explicit:
+        return explicit
+    uid = getattr(os, "getuid", lambda: -1)()
+    return f"/run/user/{uid}"
+
+
+def systemctl_user_env() -> dict[str, str]:
+    """Environment for ``systemctl --user``, with the session-bus pointers
+    backfilled when absent.
+
+    ``systemctl --user`` finds the per-user systemd instance through
+    ``XDG_RUNTIME_DIR`` + ``DBUS_SESSION_BUS_ADDRESS``. A process launched from
+    a systemd SYSTEM unit — which is how ``kirocrew service install`` runs the
+    gateway — inherits no login-session environment and therefore neither
+    variable, so a ``systemctl --user`` spawned from it dies with "Failed to
+    connect to bus: No medium found" even though the bus socket is present and
+    the unit it asks about is running. Every ``systemctl --user`` this codebase
+    spawns — the pod runtime's and the service module's user-scope verbs — reads
+    a bus failure as a verdict about the host, so every one of them resolves its
+    environment here: an "unreachable" reading is never an artifact of the
+    spawning shell's missing variables.
+
+    Only ever ADDS: an explicitly-set value always wins, so a caller that has
+    deliberately pointed at another bus is left untouched. The socket must exist
+    before we name it — if ``systemd --user`` genuinely is not running we want
+    systemctl's own diagnostic, not a failure against a path we invented.
+    """
+    env = {**os.environ}
+    runtime_dir = session_runtime_dir()
+    if not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        sock = os.path.join(runtime_dir, "bus")
+        if os.path.exists(sock):
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={sock}"
+    env.setdefault("XDG_RUNTIME_DIR", runtime_dir)
+    return env
+
+
 def launchd_live_program() -> "os.PathLike[str]":
     """Stable path the launchd agent's ``ProgramArguments[0]`` points at.
 
