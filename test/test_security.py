@@ -1229,6 +1229,25 @@ class TestTokenParamValueRedaction:
             assert result == text
             assert warnings == []
 
+    def test_a_tag_with_glued_bytes_is_a_value_not_a_tag(self) -> None:
+        """Trust is byte identity of the ENTIRE value: a registered tag with bytes
+        glued to its `]` is redacted whole, with the warning `scrub_reason` gates
+        on, and the result is a fixed point. A tag followed by a value boundary is
+        a bare tag with an ordinary tail."""
+        from kiro_crew.security import CREDENTIAL_REDACTION_TAGS
+
+        for tag in CREDENTIAL_REDACTION_TAGS:
+            glued = f"{tag}{self._OPAQUE}"
+            result, warnings = redact_credentials(f"?token={glued}&x=1")
+            assert result == "?token=[REDACTED: credential]&x=1", tag
+            assert self._OPAQUE not in result
+            assert warnings == [f"Redacted token parameter value ({len(glued)} chars)"]
+            again, more = redact_credentials(result)
+            assert again == result and more == []
+
+            tailed = f"?token={tag} and more text"
+            assert redact_credentials(tailed) == (tailed, [])
+
     def test_blocking_surface_unchanged(self) -> None:
         """Redaction-only: `_contains_fixed_credential` gates request-BLOCKING
         decisions in `exfil.py` and must not learn the parameter name -- a

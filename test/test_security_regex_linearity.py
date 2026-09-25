@@ -74,15 +74,17 @@ REDACTION_GOLDEN: list[tuple[str, str, list[str]]] = [
             "Redacted credential pattern (26 chars)",
         ],
     ),
+    # Key-anchored branches redact the VALUE group only: the key and separator
+    # survive and the reported length is the value's, not the whole match's.
     (
         "SecretAccessKey=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        _TAG,
-        ["Redacted credential pattern (56 chars)"],
+        f"SecretAccessKey={_TAG}",
+        ["Redacted credential pattern (40 chars)"],
     ),
     (
         "aws_secret_access_key = wJalrXUtnFEMI/K7MDENG",
-        _TAG,
-        ["Redacted credential pattern (45 chars)"],
+        f"aws_secret_access_key = {_TAG}",
+        ["Redacted credential pattern (21 chars)"],
     ),
     (
         f"Token is {_XOXB}",

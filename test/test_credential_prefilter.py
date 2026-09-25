@@ -62,6 +62,34 @@ _REFERENCE_TOKEN_PARAM_RE = re.compile(
 # ── Reference oracle: the implementation as it stood before the optimisation ──
 
 
+def _value_span(m: "re.Match[str]") -> tuple[int, int]:
+    """The span pass 1 redacts: the branch's one participating named group, else all.
+
+    Spelled from the NAMES the alternation declares rather than from
+    ``Match.lastindex`` so it shares nothing with the live helper beyond the
+    definition of the answer.
+    """
+    participating = [name for name in _CREDENTIAL_PATTERNS.groupindex if m.group(name) is not None]
+    if not participating:
+        return m.span()
+    assert len(participating) == 1, participating
+    return m.span(participating[0])
+
+
+def _reference_inside_fixed_tag(text: str, start: int, end: int) -> bool:
+    """Whether ``text[start:end]`` sits inside a fixed credential tag literal
+    that begins at ``start`` -- the one value passes 1 and 4 decline to claim.
+
+    Spelled from the two literals rather than from the registry or the live
+    predicate so it shares nothing with them beyond the definition of the
+    answer. Byte identity with the literal, and the span must end inside it.
+    """
+    return any(
+        text.startswith(tag, start) and end <= start + len(tag)
+        for tag in ("[REDACTED: credential]", "[REDACTED: encoded credential]")
+    )
+
+
 def _reference_uncovered(
     start: int, end: int, taken: list[tuple[int, int, str]]
 ) -> list[tuple[int, int]]:
@@ -108,10 +136,17 @@ def _reference_redact_credentials(text: str) -> tuple[str, list[str]]:
     warnings: list[str] = []
     taken: list[tuple[int, int, str]] = []
 
-    # 1. plaintext credential patterns — ungated full scan
+    # 1. plaintext credential patterns — ungated full scan. A key-anchored branch
+    #    carries its value as the one capturing group, and only the value is
+    #    redacted; a groupless branch is the secret itself and goes whole. A
+    #    value that is already one of the two fixed credential tags is left
+    #    alone (byte identity, span inside the literal), as in pass 4 below.
     for m in _CREDENTIAL_PATTERNS.finditer(text):
-        warnings.append(f"Redacted credential pattern ({len(m.group())} chars)")
-        taken.append((m.start(), m.end(), _REDACTED_CREDENTIAL_TAG))
+        start, end = _value_span(m)
+        if _reference_inside_fixed_tag(text, start, end):
+            continue
+        warnings.append(f"Redacted credential pattern ({end - start} chars)")
+        taken.append((start, end, _REDACTED_CREDENTIAL_TAG))
 
     # 2. base64-encoded credentials — own scan, decode via the generic helper
     pass2: list[tuple[int, int, str]] = []
@@ -143,10 +178,7 @@ def _reference_redact_credentials(text: str) -> tuple[str, list[str]]:
     pass4: list[tuple[int, int, str]] = []
     for m in _REFERENCE_TOKEN_PARAM_RE.finditer(text):
         # Byte identity only: trust the two fixed credential literals, never a shape.
-        if any(
-            text.startswith(tag, m.start(1))
-            for tag in ("[REDACTED: credential]", "[REDACTED: encoded credential]")
-        ):
+        if _reference_inside_fixed_tag(text, m.start(1), m.end(1)):
             continue
         gaps = _reference_uncovered(m.start(1), m.end(1), taken)
         if not gaps:
@@ -375,6 +407,18 @@ def _corpus() -> list[str]:
         f"ghp_{'a' * 36} ghp_{'a' * 36}",
         f"ghp_{'a' * 36}ghp_{'b' * 36}",
         f"AKIAIOSFODNN7EXAMPLE AKIAIOSFODNN7EXAMPLE aws_secret_access_key={AWS_SECRET}",
+        # already-redacted key-anchored pairs: the redactor's own output, seen
+        # again by a surface that re-runs it. A fixed point (legacy-equivalent:
+        # the legacy oracle mirrors pass 1's tag skip), while a tag-SHAPED value
+        # that is not the literal is a value and is redacted like any other.
+        "aws_secret_access_key=[REDACTED: credential]",
+        '{"SessionToken": "[REDACTED: credential]", "Expiration": "2030-01-01T00:00:00Z"}',
+        "AccessKeyId: [REDACTED: encoded credential] # trailing",
+        f'{{"Authorization": "[REDACTED: credential]", "aws_secret_access_key": "{AWS_SECRET}"}}',
+        "aws_secret_access_key=[REDACTED: credential]glued-tail",
+        f"aws_secret_access_key=[REDACTED{AWS_SECRET}",
+        "aws_secret_access_key=[REDACTED:credential]Xk9fQ2mP4nR7sT1v",
+        "aws_secret_access_key=[REDACTED: suspicious URL to collect.example]",
         # a match whose text also occurs earlier behind a lookbehind that rejects it
         "x" + "M" + "a" * 24 + ".abc123." + "b" * 27 + " " + "M" + "a" * 24 + ".abc123." + "b" * 27,
         # base64-encoded credential (pass 2)
@@ -451,6 +495,12 @@ def _corpus() -> list[str]:
         # bare one is judged on its own span, not on whether the value remains.
         f"aws_secret_access_key={AWS_SECRET} {AWS_SECRET}",
         f"{AWS_SECRET} aws_secret_access_key={AWS_SECRET}",
+        # A bare key glued to the `aws` of the label that follows it, so the run
+        # ends three letters into the label. Pass 1 redacts the labelled VALUE
+        # only, so the run stays whole in the text and pass 3 removes it in both
+        # redactors (glue, key and the label's `aws` head together); the label's
+        # `_secret_access_key=` remainder survives in both.
+        f"D{AWS_SECRET}ZGHUT8aws_secret_access_key={AWS_SECRET}",
     ]
     return cases
 
@@ -467,13 +517,6 @@ LEGACY_DIVERGENT_SHAPES: tuple[tuple[str, str], ...] = (
     # A bare key hosted inside an earlier declined run (pass 3): same, the whole
     # standalone key survives.
     (f"{_SLASHY_SECRET_HOST} {_SLASHY_SECRET}", f" {_SLASHY_SECRET}"),
-    # A glued key whose tail is the first word of the label that follows it.
-    # Legacy skips the run (its tail is gone), then the labelled value's own
-    # pass-3 lookup lands inside the run by coincidence of equal text and
-    # redacts exactly the key, leaving the glue around it. With a DIFFERENT
-    # labelled value that coincidence is gone and the glued key leaks whole; the
-    # by-span redactor removes the whole run either way.
-    (f"D{AWS_SECRET}ZGHUT8aws_secret_access_key={AWS_SECRET}", "ZGHUT8"),
     # A run whose head pass 1 took (`sk-proj-` consumes alphanumerics up to the
     # first slash): legacy skips the run and the key's 26-char tail survives.
     (f"sk-proj-{'a' * 20}Z{AWS_SECRET}", AWS_SECRET[14:]),
@@ -560,13 +603,25 @@ def _legacy_redact_credentials(text: str) -> tuple[str, list[str]]:
     removes (``test_legacy_diverges_on_every_by_span_shape``). The by-span
     oracle above shares its algorithm with the live function, so it cannot
     carry either claim on its own.
+
+    Pass 1 is the one place this oracle follows the live redactor: ``sub()``
+    replaces only the value group of a key-anchored branch (the key, separator
+    and quotes stay) and leaves a value that is already a fixed credential tag
+    untouched, so the two claims above stay about passes 2 and 3, where the
+    by-value defect this oracle preserves lives. Pass 1's own span rule is
+    pinned by ``test_redaction_key_anchored_value_span.py``.
     """
     warnings: list[str] = []
     result = text
 
     def _redact_one(m: "re.Match[str]") -> str:
-        warnings.append(f"Redacted credential pattern ({len(m.group())} chars)")
-        return _REDACTED_CREDENTIAL_TAG
+        start, end = _value_span(m)
+        if _reference_inside_fixed_tag(text, start, end):
+            return m.group()
+        warnings.append(f"Redacted credential pattern ({end - start} chars)")
+        return (
+            m.group()[: start - m.start()] + _REDACTED_CREDENTIAL_TAG + m.group()[end - m.start() :]
+        )
 
     result = _CREDENTIAL_PATTERNS.sub(_redact_one, result)
 
@@ -701,11 +756,39 @@ def test_hosted_bare_secret_is_redacted_at_its_own_span() -> None:
 def test_partly_claimed_run_keeps_no_plaintext() -> None:
     """A later pass redacts whatever of its span an earlier pass left standing.
 
-    A key glued to the ``aws`` of a following ``aws_secret_access_key=`` label
-    forms one base64 run whose last three chars pass 1 claims. The run as a
-    whole is a bare secret; skipping it because part of it is gone would leave
-    the glued key in plaintext, and re-redacting the claimed tail would
-    corrupt the pass-1 tag. Only the unclaimed head is spliced.
+    A key glued to a following AWS access key id forms one base64 run whose
+    last twenty chars pass 1 claims (the id branch has no value group, so it is
+    redacted whole). The run as a whole is a bare secret; skipping it because
+    part of it is gone would leave the glued key in plaintext, and re-redacting
+    the claimed tail would corrupt the pass-1 tag. Only the unclaimed head is
+    spliced.
+    """
+    key_id = "AKIAIOSFODNN7EXAMPLE"
+    run = f"D{AWS_SECRET}ZGHUT8{key_id}"
+    text = f"{run} trailing"
+    assert [m.group() for m in _B64_CHUNK_RE.finditer(text)] == [run]
+    assert _contains_bare_secret(run), "corpus assumption: the glued run is a bare secret"
+
+    redacted, warnings = redact_credentials(text)
+
+    assert AWS_SECRET not in redacted
+    assert key_id not in redacted
+    assert redacted == f"{_REDACTED_CREDENTIAL_TAG}{_REDACTED_CREDENTIAL_TAG} trailing"
+    assert warnings == [
+        f"Redacted credential pattern ({len(key_id)} chars)",
+        f"Redacted bare secret key ({len(run)} chars)",
+    ]
+
+
+def test_bare_key_glued_to_a_label_takes_the_label_head_with_the_run() -> None:
+    """Accepted residual, pinned as a decision.
+
+    Pass 3 judges whole base64 runs. A key glued to the ``aws`` of a following
+    ``aws_secret_access_key=`` label with no delimiter between them is ONE run
+    that ends three letters into the label, so those three letters go with the
+    run. Pass 1 still redacts the labelled VALUE only, so the label's remainder
+    survives, and no secret byte does. A document with a delimiter between the
+    two is not this shape and keeps its label whole.
     """
     run = f"D{AWS_SECRET}ZGHUT8aws"
     text = f"D{AWS_SECRET}ZGHUT8aws_secret_access_key={AWS_SECRET}"
@@ -715,9 +798,9 @@ def test_partly_claimed_run_keeps_no_plaintext() -> None:
     redacted, warnings = redact_credentials(text)
 
     assert AWS_SECRET not in redacted
-    assert redacted == f"{_REDACTED_CREDENTIAL_TAG}{_REDACTED_CREDENTIAL_TAG}"
+    assert redacted == f"{_REDACTED_CREDENTIAL_TAG}_secret_access_key={_REDACTED_CREDENTIAL_TAG}"
     assert warnings == [
-        f"Redacted credential pattern ({len(text) - len(run) + 3} chars)",
+        f"Redacted credential pattern ({len(AWS_SECRET)} chars)",
         f"Redacted bare secret key ({len(run)} chars)",
     ]
 
