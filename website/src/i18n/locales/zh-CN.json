@@ -6981,7 +6981,8 @@
       "copy_chip_name": "复制 {{text}}",
       "open_path_chip_name": "打开 {{path}}",
       "browse_path_chip_name": "浏览 {{path}}",
-      "switch_to_session_chip_name": "切换到会话 {{label}}"
+      "switch_to_session_chip_name": "切换到会话 {{label}}",
+      "copy_failed_select_the_text_to_copy_it_manually": "复制失败 — 请选中文本手动复制"
     },
     "markdownToc": {
       "contents": "目录",

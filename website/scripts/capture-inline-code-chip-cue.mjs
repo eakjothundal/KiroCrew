@@ -14,12 +14,15 @@
  *     status region with the same word; the bubble survives the pointer leaving
  *     and closes by itself when the flash ends.
  *  4. With both clipboard layers stubbed to refuse, the click renders the
- *     "Copy failed" notice in the SAME bubble (an ErrorNotice, announced once),
- *     claims nothing, and moves nothing in the paragraph; it too outlives the
- *     leave and clears itself.
+ *     "Copy failed" notice — naming the recovery: select the text — in the SAME
+ *     bubble (an ErrorNotice, announced once), claims nothing, and moves nothing
+ *     in the paragraph; it too outlives the leave and clears itself.
  *  5. A long path chip still breaks across lines (measured: more than one
  *     client rect), and a copy on a long copy chip moves nothing on the line —
  *     the text after it has the same box before and after the confirmation.
+ *     Its bubble opens BELOW the chip (it is past its message's first line), so
+ *     the words leading up to the chip stay readable; a first-line chip's opens
+ *     above, off the message. Every bubble stays inside the viewport.
  *  6. On the default theme, a session chip paints in the accent like the path
  *     chips (the copy chip beside it is neutral), and its Ctrl+click copy
  *     confirms in its title only once the write lands, without switching.
@@ -128,19 +131,34 @@ async function main() {
     console.log(`${ok ? 'PASS' : 'FAIL'}: ${label}`)
     if (!ok) failures += 1
   }
-  /** Clip the frame to `locator`'s box, grown by `pad` so a bubble above it stays in.
-   *  The transcript is taller than the viewport, so bring the target fully into
-   *  view first — a box partly above y=0 would clip whatever else sits there. */
-  const shotAround = async (locator, name, pad = 48) => {
+  /** Clip the frame to `locator`'s box, grown by `pad` above and `padBelow`
+   *  under it so a bubble on either side stays in. The transcript is taller
+   *  than the viewport, so bring the target fully into view first — a box
+   *  partly above y=0 would clip whatever else sits there. */
+  const shotAround = async (locator, name, pad = 48, padBelow = 56) => {
     await locator.scrollIntoViewIfNeeded()
     await h.page.waitForTimeout(200)
     const box = await locator.boundingBox()
     const clip = {
       x: Math.max(0, box.x - 16), y: Math.max(0, box.y - pad),
-      width: Math.min(1180 - Math.max(0, box.x - 16), box.width + 32), height: box.height + pad + 16,
+      width: Math.min(1180 - Math.max(0, box.x - 16), box.width + 32), height: box.height + pad + padBelow,
     }
     await h.page.screenshot({ path: `${OUT}/${name}.png`, clip })
     console.log('wrote', `${OUT}/${name}.png`)
+  }
+  /** The open bubble's side and geometry, next to the anchor's own rects. */
+  const bubbleGeometry = async chip => {
+    const tip = await h.page.locator('[role="tooltip"]').evaluate(el => {
+      const r = el.getBoundingClientRect()
+      return { placement: el.getAttribute('data-placement'), top: Math.round(parseFloat(el.style.top)), left: Math.round(parseFloat(el.style.left)), right: Math.round(r.right), bottom: Math.round(r.bottom), y: Math.round(r.top) }
+    })
+    const anchor = await chip.evaluate(el => {
+      const rects = [...el.getClientRects()]
+      const first = rects[0] ?? el.getBoundingClientRect()
+      const box = el.getBoundingClientRect()
+      return { firstLeft: Math.round(first.left), firstTop: Math.round(first.top), boxLeft: Math.round(box.left), boxBottom: Math.round(box.bottom), lines: rects.length }
+    })
+    return { tip, anchor }
   }
 
   const copyChip = () => h.page.locator('code[aria-label="Copy npm test"]')
@@ -221,6 +239,11 @@ async function main() {
   const describedBy = await copyChip().getAttribute('aria-describedby')
   const tipId = await h.page.locator('[role="tooltip"]').getAttribute('id')
   assert('hover: tooltip is the chip\'s accessible description', !!describedBy && describedBy === tipId)
+  // The npm test chip sits on its message's FIRST line: above is off the
+  // message, so the bubble opens there (the flow rule's only "above").
+  const hoverGeo = await bubbleGeometry(copyChip())
+  assert(`hover: a first-line chip opens its bubble above, at its first fragment (${JSON.stringify(hoverGeo.tip)} vs ${JSON.stringify(hoverGeo.anchor)})`,
+    hoverGeo.tip.placement === 'above' && hoverGeo.tip.top === hoverGeo.anchor.firstTop - 8 && Math.abs(hoverGeo.tip.left - hoverGeo.anchor.firstLeft) <= 8)
   await shotAround(firstMsg(), 'hover-tooltip')
 
   // Contrast: hovering the path chip underlines it SOLID — the link look it keeps.
@@ -293,7 +316,15 @@ async function main() {
   // the text flow, so the paragraph's box is byte-identical.
   const failNotice = h.page.locator('[role="tooltip"] [data-testid="md-chip-copy-error"]')
   assert(`refused: exactly one "Copy failed" notice renders, inside the bubble (${await failNotice.count()})`, (await failNotice.count()) === 1)
-  assert('refused: the notice reads "Copy failed"', /Copy failed/.test((await failNotice.textContent()) ?? ''))
+  const failText = (await failNotice.textContent()) ?? ''
+  assert(`refused: the notice names the recovery, verbatim (${JSON.stringify(failText.trim())})`,
+    failText.includes('Copy failed — select the text to copy it manually'))
+  // The notice is wider than the hint it replaced: the bubble must have been
+  // re-measured against the viewport edge for it, so it ends on-screen.
+  const failGeo = await bubbleGeometry(envChip)
+  const viewportWidth = await h.page.evaluate(() => window.innerWidth)
+  assert(`refused: the wider notice's bubble stays inside the viewport (right ${failGeo.tip.right} <= ${viewportWidth - 8}, left ${failGeo.tip.left} >= 8)`,
+    failGeo.tip.right <= viewportWidth - 8 && failGeo.tip.left >= 8)
   // Announced once, through the notice itself: it is the bubble's accessible
   // `role="alert"` (no aria-hidden ancestor) and the only alert that carries
   // the failure — no sr-only copy of it anywhere.
@@ -366,6 +397,26 @@ async function main() {
     tailBefore.h === tailAfter.h && tailBefore.bottom === tailAfter.bottom)
   const copyRectsAfter = await longCopy.evaluate(el => el.getClientRects().length)
   assert(`wrap: long copy chip still spans ${copyRectsAfter} line boxes while confirmed`, copyRectsAfter === copyRects)
+  // The wrapped chip is past its message's first line, so the bubble opens
+  // BELOW it — under the box's bottom-left, where the chip ends — instead of
+  // above its first fragment, where it covered the sentence before it.
+  const wrapGeo = await bubbleGeometry(longCopy)
+  assert(`wrap: a lower chip opens its bubble below its last line (${JSON.stringify(wrapGeo.tip)} vs ${JSON.stringify(wrapGeo.anchor)})`,
+    wrapGeo.tip.placement === 'below' && wrapGeo.tip.top === wrapGeo.anchor.boxBottom + 8 && wrapGeo.tip.left === wrapGeo.anchor.boxLeft && wrapGeo.tip.y >= wrapGeo.anchor.boxBottom)
+  // What the UX read flagged: the bubble used to hide the words before the
+  // chip. Those words are the paragraph's opening text; its line must end above
+  // where the bubble now starts.
+  const openingBottom = await longCopy.evaluate(el => {
+    const p = el.closest('p')
+    const walker = document.createTreeWalker(p, NodeFilter.SHOW_TEXT)
+    const first = walker.nextNode()
+    const range = document.createRange()
+    range.selectNodeContents(first)
+    return Math.round(range.getClientRects()[0].bottom)
+  })
+  assert(`wrap: the sentence's opening stays uncovered (line bottom ${openingBottom} <= bubble top ${wrapGeo.tip.y})`, openingBottom <= wrapGeo.tip.y)
+  const viewportHeight = await h.page.evaluate(() => window.innerHeight)
+  assert(`wrap: the bubble below fits inside the viewport (bottom ${wrapGeo.tip.bottom} <= ${viewportHeight - 8})`, wrapGeo.tip.bottom <= viewportHeight - 8)
   await shotAround(lastMsg(), 'long-path-wraps')
 
   // --- Session chip, on the default (Kiro dark) theme: recoloured by the same
@@ -428,7 +479,7 @@ async function main() {
     await chip.click({ modifiers })
     await h.page.waitForTimeout(300)
     assert(`${name} refused: exactly one "Copy failed" notice, inside a bubble (${await bubbleNotice.count()})`,
-      (await bubbleNotice.count()) === 1 && /Copy failed/.test((await bubbleNotice.textContent()) ?? ''))
+      (await bubbleNotice.count()) === 1 && ((await bubbleNotice.textContent()) ?? '').includes('Copy failed — select the text to copy it manually'))
     assert(`${name} refused: one bubble in the document`, (await h.page.locator('[role="tooltip"]').count()) === 1)
     assert(`${name} refused: the notice is the accessible alert and the only one carrying the failure`,
       (await bubbleNotice.getAttribute('role')) === 'alert'
@@ -438,11 +489,18 @@ async function main() {
     assert(`${name} refused: no dismiss control (the flash clears itself)`, (await bubbleNotice.locator('button').count()) === 0)
     assert(`${name} refused: the chip never claims "Copied!" (${await chip.getAttribute('title')})`,
       (await chip.getAttribute('title')) !== 'Copied!')
-    // The bubble sits over the pressed chip: its left edge is the chip's first
-    // line fragment's, as for the copy chip.
-    const chipLeft = await chip.evaluate(el => Math.round((el.getClientRects()[0] ?? el.getBoundingClientRect()).left))
-    const tipLeft = await h.page.locator('[role="tooltip"]').evaluate(el => Math.round(parseFloat(el.style.left)))
-    assert(`${name} refused: the bubble opens at the pressed chip (${tipLeft} vs ${chipLeft})`, Math.abs(tipLeft - chipLeft) <= 8)
+    // The bubble sits at the pressed chip, on the side the flow rule picks:
+    // above its first line fragment when the chip is on the message's first
+    // line, else below its box (bottom-left, where the chip ends). A chip near
+    // the right edge has its bubble pulled left by the viewport clamp instead,
+    // ending 8px inside the edge — that is the clamp doing its job.
+    const geo = await bubbleGeometry(chip)
+    const wantLeft = geo.tip.placement === 'below' ? geo.anchor.boxLeft : geo.anchor.firstLeft
+    const wantTop = geo.tip.placement === 'below' ? geo.anchor.boxBottom + 8 : geo.anchor.firstTop - 8
+    const clamped = geo.tip.left < wantLeft && geo.tip.right >= viewportWidth - 9
+    const atChip = geo.tip.top === wantTop && (Math.abs(geo.tip.left - wantLeft) <= 8 || clamped)
+    assert(`${name} refused: the bubble opens at the pressed chip, ${geo.tip.placement} it${clamped ? ', clamped to the viewport edge' : ''} (${JSON.stringify(geo.tip)} vs ${JSON.stringify(geo.anchor)})`, atChip)
+    assert(`${name} refused: the bubble stays inside the viewport (right ${geo.tip.right} <= ${viewportWidth - 8})`, geo.tip.right <= viewportWidth - 8 && geo.tip.left >= 8)
     await shotAround(thirdMsg(), frame)
   }
   const thirdParaAfter = await thirdMsg().locator('p').evaluateAll(ps => ps.map(p => p.innerHTML))

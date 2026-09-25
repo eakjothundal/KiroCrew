@@ -7087,7 +7087,8 @@
       "copy_chip_name": "{{text}} কপি করো",
       "open_path_chip_name": "{{path}} খোলো",
       "browse_path_chip_name": "{{path}} ব্রাউজ করো",
-      "switch_to_session_chip_name": "{{label}} সেশনে যাও"
+      "switch_to_session_chip_name": "{{label}} সেশনে যাও",
+      "copy_failed_select_the_text_to_copy_it_manually": "কপি ব্যর্থ — টেক্সট নির্বাচন করে ম্যানুয়ালি কপি করো"
     },
     "markdownToc": {
       "contents": "বিষয়সূচি",

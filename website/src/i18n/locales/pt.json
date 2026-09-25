@@ -7193,7 +7193,8 @@
       "copy_chip_name": "Copiar {{text}}",
       "open_path_chip_name": "Abrir {{path}}",
       "browse_path_chip_name": "Navegar em {{path}}",
-      "switch_to_session_chip_name": "Alternar para a sessão {{label}}"
+      "switch_to_session_chip_name": "Alternar para a sessão {{label}}",
+      "copy_failed_select_the_text_to_copy_it_manually": "Falha ao copiar — selecione o texto para copiá-lo manualmente"
     },
     "markdownToc": {
       "contents": "Conteúdo",

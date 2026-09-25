@@ -6456,7 +6456,8 @@
       "copy_chip_name": "[Çøþý {{text}} ········]",
       "open_path_chip_name": "[Øþèñ {{path}} ········]",
       "browse_path_chip_name": "[Ɓŕøẁşè {{path}} ···········]",
-      "switch_to_session_chip_name": "[Şẁìţçĥ ţø şèşşìøñ {{label}} ················]"
+      "switch_to_session_chip_name": "[Şẁìţçĥ ţø şèşşìøñ {{label}} ················]",
+      "copy_failed_select_the_text_to_copy_it_manually": "[Çøþý ƒàìĺèð — şèĺèçţ ţĥè ţèẋţ ţø çøþý ìţ ɱàñùàĺĺý ·························]"
     },
     "markdownToc": {
       "contents": "[Çøñţèñţş ············]",

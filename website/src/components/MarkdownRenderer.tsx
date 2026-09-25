@@ -1786,11 +1786,14 @@ function useCopiedFlash(text: string): {
  *
  * One component so the chips cannot drift on the surface (`ErrorNotice`, the
  * rule `errors-use-error-notice` requires), the wording, or the hand-off
- * decision. Its `role="alert"` is the accessible error surface and the ONLY
- * announcement of the refusal: nothing else carries the string, so it is heard
- * once. Its `message` is the report key `ErrorNotice` looks up; a refused
- * clipboard write is a browser-side outcome with no entry in the error journal,
- * so the lookup finds nothing and the notice stands on the message alone.
+ * decision. The wording names the next step, not only the outcome: the text
+ * the user wanted is still on screen, so selecting it IS the recovery, and a
+ * bare "Copy failed" left them asking what to do about it. Its `role="alert"`
+ * is the accessible error surface and the ONLY announcement of the refusal:
+ * nothing else carries the string, so it is heard once. Its `message` is the
+ * report key `ErrorNotice` looks up; a refused clipboard write is a
+ * browser-side outcome with no entry in the error journal, so the lookup finds
+ * nothing and the notice stands on the message alone.
  *
  * One placement: inside an `InstantTip` bubble, held for `COPY_FAILED_FLASH_MS`
  * and closed by the flash's own timer. The copy chip's bubble also carries its
@@ -1812,7 +1815,7 @@ function CopyFailedNotice() {
           pointer-events-none bubble that closes itself would be dead anyway.) */}
       <ErrorNotice
         variant="inline"
-        message={i18nT('components.markdownRenderer.copy_failed')}
+        message={i18nT('components.markdownRenderer.copy_failed_select_the_text_to_copy_it_manually')}
         testId="md-chip-copy-error"
       />
     </>
@@ -1840,7 +1843,7 @@ function useTitleCuedCopy(text: string): {
   failureBubble: React.ReactNode
 } {
   const { copied, failed, flashSeq, copy } = useCopiedFlash(text)
-  const { tip, tipId, arm } = useInstantTip({ hold: failed ? flashSeq : 0 })
+  const { tip, tipId, arm } = useInstantTip({ hold: failed ? flashSeq : 0, placement: 'flow' })
   const press = (el: HTMLElement) => {
     arm(el)
     copy(text)
@@ -1926,7 +1929,9 @@ function CopyableCode({ className, safeProps, text, children }: {
   // new outcome that must reopen a bubble a scroll or Escape closed, and a
   // boolean that stays true has no edge for it. `arm` names the pressed chip
   // for that reopen — after an Escape no enter or focus fires for the retry.
-  const { tip, tipHandlers, tipId, arm } = useInstantTip({ hold: flashSeq })
+  // `flow`: above from the message's first line, below from any lower one, so
+  // the bubble never covers the words that lead up to the chip.
+  const { tip, tipHandlers, tipId, arm } = useInstantTip({ hold: flashSeq, placement: 'flow' })
   const handleCopy = (e: React.MouseEvent | React.KeyboardEvent) => {
     e.preventDefault()
     e.stopPropagation()

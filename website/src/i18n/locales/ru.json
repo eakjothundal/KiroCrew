@@ -7299,7 +7299,8 @@
       "copy_chip_name": "Скопировать {{text}}",
       "open_path_chip_name": "Открыть {{path}}",
       "browse_path_chip_name": "Просмотреть {{path}}",
-      "switch_to_session_chip_name": "Переключиться на сессию {{label}}"
+      "switch_to_session_chip_name": "Переключиться на сессию {{label}}",
+      "copy_failed_select_the_text_to_copy_it_manually": "Не удалось скопировать — выдели текст, чтобы скопировать его вручную"
     },
     "markdownToc": {
       "contents": "Содержание",

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, fireEvent, screen, createEvent, act } from '@testing-library/react'
 
-import MarkdownRenderer, { COPY_FAILED_FLASH_MS } from '../components/MarkdownRenderer'
+import MarkdownRenderer, { COPIED_FLASH_MS, COPY_FAILED_FLASH_MS } from '../components/MarkdownRenderer'
 import { copyToClipboard } from '../utils/clipboard'
 import { buildShareableUrl } from '../utils/shareUrl'
 
@@ -710,7 +710,7 @@ describe('session chip — copy acknowledgment', () => {
     expect(alerts[0]).toHaveTextContent('Copy failed')
 
     // The rest of the window changes nothing: the failure stays, nothing flips.
-    act(() => { vi.advanceTimersByTime(1500) })
+    act(() => { vi.advanceTimersByTime(COPIED_FLASH_MS) })
     expect(chip).toHaveAttribute('title', restTitle)
     expect(chip.querySelectorAll('svg')).toHaveLength(restGlyphs)
     expect(screen.getByTestId('md-chip-copy-error')).toHaveTextContent('Copy failed')

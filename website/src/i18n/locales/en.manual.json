@@ -2512,7 +2512,8 @@
       "copy_chip_name": "Copy {{text}}",
       "open_path_chip_name": "Open {{path}}",
       "browse_path_chip_name": "Browse {{path}}",
-      "switch_to_session_chip_name": "Switch to session {{label}}"
+      "switch_to_session_chip_name": "Switch to session {{label}}",
+      "copy_failed_select_the_text_to_copy_it_manually": "Copy failed — select the text to copy it manually"
     },
     "mcpAppFrame": {
       "collapse": "Collapse",

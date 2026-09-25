@@ -12,7 +12,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, fireEvent, act, screen, waitFor } from '@testing-library/react'
-import MarkdownRenderer from '../components/MarkdownRenderer'
+import MarkdownRenderer, { COPIED_FLASH_MS } from '../components/MarkdownRenderer'
 import { OPEN_DELAY_MS } from '../components/InstantTip'
 import { copyToClipboard } from '../utils/clipboard'
 import { __resetPathKindCache } from '../hooks/usePathKind'
@@ -263,8 +263,45 @@ describe('inline-code chips: each class names its own click', () => {
     expect(chip.querySelectorAll('svg').length).toBe(before.svgs)
     expect(chip.className).not.toMatch(ATOMIC)
 
-    act(() => { vi.advanceTimersByTime(1500) })
+    act(() => { vi.advanceTimersByTime(COPIED_FLASH_MS) })
     expect(screen.getByRole('status')).toHaveTextContent('')
+  })
+
+  it('a chip past the message\'s first line opens its bubble BELOW, so the words leading up to it stay readable', () => {
+    // A bubble above a chip on a lower line covers the preceding prose — the
+    // sentence the reader is in the middle of. The rendered message is the
+    // flow: a chip on its first line still opens above (off the message), any
+    // lower chip opens under its own box. jsdom lays nothing out, so the first
+    // line is handed over through Range.getClientRects (100..118) and each
+    // chip's rects are set by hand.
+    const rect = (top: number, left: number, right: number, height = 20): DOMRect =>
+      ({ top, left, right, bottom: top + height, width: right - left, height, x: left, y: top, toJSON: () => ({}) }) as DOMRect
+    Object.defineProperty(Range.prototype, 'getClientRects', { configurable: true, value: () => [rect(100, 20, 60, 18)] })
+    try {
+      render(<MarkdownRenderer content={'Run `npm test` first.\n\nThen set `NODE_ENV=production` before the build.'} />)
+      // The flow container is the renderer's own per-message root, the one
+      // that already carries `data-image-scope` (one rendered message): no
+      // second attribute is added to that element.
+      const root = document.querySelector('[data-image-scope]')
+      expect(root).not.toBeNull()
+      expect(root!.hasAttribute('data-tip-flow')).toBe(false)
+      expect(root!.contains(screen.getByRole('button', { name: 'Copy npm test' }))).toBe(true)
+      const first = screen.getByRole('button', { name: 'Copy npm test' })
+      const lower = screen.getByRole('button', { name: 'Copy NODE_ENV=production' })
+      first.getBoundingClientRect = () => rect(102, 40, 110)
+      lower.getBoundingClientRect = () => rect(150, 60, 220)
+      fireEvent.focus(first)
+      let tip = screen.getByRole('tooltip')
+      expect(tip).toHaveAttribute('data-placement', 'above')
+      expect(parseFloat(tip.style.top)).toBe(94)
+      fireEvent.blur(first)
+      fireEvent.focus(lower)
+      tip = screen.getByRole('tooltip')
+      expect(tip).toHaveAttribute('data-placement', 'below')
+      expect([parseFloat(tip.style.top), parseFloat(tip.style.left)]).toEqual([178, 60])
+    } finally {
+      delete (Range.prototype as unknown as Record<string, unknown>).getClientRects
+    }
   })
 
   it('a session chip names its switch AND keeps the visible key in the name, with the actionable look', () => {

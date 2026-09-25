@@ -6981,7 +6981,8 @@
       "copy_chip_name": "{{text}} 복사",
       "open_path_chip_name": "{{path}} 열기",
       "browse_path_chip_name": "{{path}} 찾아보기",
-      "switch_to_session_chip_name": "{{label}} 세션으로 전환"
+      "switch_to_session_chip_name": "{{label}} 세션으로 전환",
+      "copy_failed_select_the_text_to_copy_it_manually": "복사 실패 — 텍스트를 선택해 직접 복사하세요"
     },
     "markdownToc": {
       "contents": "목차",
