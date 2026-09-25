@@ -655,17 +655,17 @@ def _completion_disabled(completion_cfg: dict) -> bool:
 def _resolve_cwd(cfg: dict, requested: str | None) -> str:
     """Resolve the PTY working directory.
 
-    A valid client-requested dir (the chat's project dir, passed as ?cwd=) wins;
-    otherwise the configured cwd, else $HOME. The requested dir must be an
-    existing directory — this is the user's own interactive shell (auth is
-    enforced at the WS handshake), so there is no root restriction beyond isdir.
+    A client-requested dir (the chat's project dir, passed as ?cwd=) must exist.
+    Without one, use the configured cwd, else $HOME. This is the user's own
+    interactive shell (auth is enforced at the WS handshake), so there is no
+    root restriction beyond isdir.
     """
     default = cfg.get("cwd") or os.environ.get("HOME") or "/"
     if requested:
         candidate = os.path.abspath(os.path.expanduser(requested))
         if os.path.isdir(candidate):
             return candidate
-        logger.warning("terminal: ignoring invalid cwd %r", requested)
+        raise ValueError("Terminal working directory does not exist")
     return default
 
 
@@ -1389,9 +1389,34 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
         registry[session_id] = None
 
     ws = web.WebSocketResponse(heartbeat=30, timeout=300)
+    cwd = ""
     try:
+        if placeholder:
+            try:
+                cwd = await asyncio.get_running_loop().run_in_executor(
+                    discovery_executor(), _resolve_cwd, cfg, request.query.get("cwd")
+                )
+            except (OSError, ValueError):
+                _sel().log_api_access(
+                    caller=caller,
+                    operation="terminal.ws.open",
+                    outcome="denied",
+                    source="dashboard",
+                    resources=f"session={session_id},invalid_cwd=1",
+                )
+                # A browser WebSocket cannot read a rejected handshake's JSON
+                # body. Report the refusal before any shell or ready frame,
+                # keeping the reservation until the bounded response finishes.
+                await ws.prepare(request)
+                await _close_terminal_ws_bounded(
+                    ws,
+                    error_message="Terminal working directory does not exist",
+                    error_code="terminal_invalid_cwd",
+                )
+                registry.pop(session_id, None)
+                return ws
         await ws.prepare(request)
-    except Exception:
+    except BaseException:
         if placeholder:
             registry.pop(session_id, None)  # type: ignore[arg-type]
         raise
@@ -1431,8 +1456,7 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 "terminal: configured shell %r not executable; falling back to %r",
                 rejected_shell, shell,
             )
-        cwd = _resolve_cwd(cfg, request.query.get("cwd"))
-        if not os.path.isdir(cwd):
+        if not request.query.get("cwd") and not os.path.isdir(cwd):
             cwd = os.path.expanduser("~")
         env = _pty_child_env({"KIROCREW_TERMINAL": "1"})
         argv = [shell, "-NoLogo"] if "powershell" in shell.lower() else [shell]
@@ -1481,7 +1505,6 @@ async def api_terminal_ws(request: web.Request) -> web.WebSocketResponse | web.R
                 termios.TIOCSWINSZ,
                 struct.pack("HHHH", 24, 80, 0, 0),
             )
-            cwd = _resolve_cwd(cfg, request.query.get("cwd"))
             env = _pty_child_env({
                 "TERM": "xterm-256color",
                 "KIROCREW_TERMINAL": "1",

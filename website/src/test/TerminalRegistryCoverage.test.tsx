@@ -38,6 +38,7 @@ import {
   disposeTerminalConnection,
   useTerminalConnStatus,
   useTerminalManualRetry,
+  useTerminalFailureCode,
   retryTerminalConnection,
 } from '../utils/terminalRegistry'
 
@@ -622,6 +623,132 @@ describe('terminalRegistry', () => {
         vi.advanceTimersByTime(60_000)
       }
       expect(WS_INSTANCES).toHaveLength(10)
+    })
+  })
+
+  describe('invalid working directory', () => {
+    function openingSession(id: string): MockWebSocket {
+      ensureTerminalConnection(id, new FakeTerm().asTerminal(), new FakeFit().asFitAddon(), '/missing/project')
+      const ws = WS_INSTANCES[WS_INSTANCES.length - 1]
+      ws.simulateOpen()
+      return ws
+    }
+
+    const failure = { type: 'error', code: 'terminal_invalid_cwd' }
+
+    it('reports failure immediately, settles waiters once, and ignores a late ready frame', () => {
+      const id = session('cwd-failure')
+      const ready = vi.fn()
+      const failed = vi.fn()
+      onTerminalReady(id, ready, failed)
+      const ws = openingSession(id)
+      const { result } = renderHook(() => ({
+        status: useTerminalConnStatus(id),
+        failure: useTerminalFailureCode(id),
+      }))
+
+      act(() => { ws.simulateJson(failure) })
+      expect(result.current).toEqual({ status: 'disconnected', failure: 'terminal_invalid_cwd' })
+      expect(failed).toHaveBeenCalledExactlyOnceWith('terminal_invalid_cwd')
+      expect(ready).not.toHaveBeenCalled()
+      act(() => { ws.simulateJson(failure); ws.simulateJson({ type: 'ready' }) })
+      expect(failed).toHaveBeenCalledTimes(1)
+      expect(getTerminalWs(id)).toBeNull()
+      expect(sendToTerminalSession(id, 'echo stale')).toBe(false)
+    })
+
+    it('immediately reports an already-known failure to a later subscriber', () => {
+      const id = session('cwd-late-subscriber')
+      const ws = openingSession(id)
+      ws.simulateJson(failure)
+      const ready = vi.fn()
+      const failed = vi.fn()
+      const off = onTerminalReady(id, ready, failed)
+      expect(failed).toHaveBeenCalledExactlyOnceWith('terminal_invalid_cwd')
+      expect(ready).not.toHaveBeenCalled()
+      off()
+    })
+
+    it('unsubscribes from both outcomes and drops waiters on disposal', () => {
+      const id = session('cwd-unsubscribed')
+      const ready = vi.fn()
+      const failed = vi.fn()
+      onTerminalReady(id, ready, failed)()
+      const ws = openingSession(id)
+      ws.simulateJson(failure)
+      expect(failed).not.toHaveBeenCalled()
+      disposeTerminalConnection(id)
+      const { result } = renderHook(() => useTerminalFailureCode(id))
+      expect(result.current).toBeNull()
+
+      onTerminalReady(id, ready, failed)
+      const next = openingSession(id)
+      disposeTerminalConnection(id)
+      // An already-queued frame from a disposed socket has no waiter to settle.
+      next.simulateJson(failure)
+      expect(failed).not.toHaveBeenCalled()
+      openSocket(id)
+      expect(ready).not.toHaveBeenCalled()
+    })
+
+    it('parks through backoff timers, online events, and visibility revival', () => {
+      const id = session('cwd-park')
+      vi.useFakeTimers()
+      const ws = openingSession(id)
+      ws.simulateJson(failure)
+      ws.simulateClose()
+      vi.advanceTimersByTime(600_000)
+      window.dispatchEvent(new Event('online'))
+      Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+      document.dispatchEvent(new Event('visibilitychange'))
+      vi.advanceTimersByTime(600_000)
+      expect(WS_INSTANCES).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(0)
+    })
+
+    it('allows explicit recovery in the same cwd without replaying failed commands', () => {
+      const id = session('cwd-recovery')
+      vi.useFakeTimers()
+      const stale = vi.fn()
+      const legacy = vi.fn()
+      const failed = vi.fn()
+      onTerminalReady(id, stale, failed)
+      onTerminalReady(id, legacy)
+      const ws = openingSession(id)
+      ws.simulateJson(failure)
+      ws.simulateClose()
+      const { result } = renderHook(() => useTerminalFailureCode(id))
+
+      act(() => { retryTerminalConnection(id) })
+      expect(result.current).toBeNull()
+      expect(WS_INSTANCES).toHaveLength(2)
+      const recovered = WS_INSTANCES[1]
+      expect(recovered.url).toBe(ws.url)
+      const fresh = vi.fn(() => sendToTerminalSession(id, 'echo fresh'))
+      onTerminalReady(id, fresh)
+      act(() => { recovered.simulateOpen(); recovered.simulateJson({ type: 'ready' }) })
+      expect(fresh).toHaveBeenCalledTimes(1)
+      expect(decode(recovered)).toBe('echo fresh\n')
+      expect(stale).not.toHaveBeenCalled()
+      expect(legacy).not.toHaveBeenCalled()
+      expect(failed).toHaveBeenCalledTimes(1)
+    })
+
+    it('coordinates an explicit retry with the rejected socket still closing', () => {
+      const id = session('cwd-closing-retry')
+      vi.useFakeTimers()
+      const ws = openingSession(id)
+      ws.simulateJson(failure)
+      ws.readyState = MockWebSocket.CLOSING
+      retryTerminalConnection(id)
+      expect(WS_INSTANCES).toHaveLength(1)
+      ws.simulateClose()
+      vi.advanceTimersByTime(1000)
+      expect(WS_INSTANCES).toHaveLength(2)
+      WS_INSTANCES[1].simulateOpen()
+      WS_INSTANCES[1].simulateJson({ type: 'ready' })
+      vi.advanceTimersByTime(600_000)
+      expect(WS_INSTANCES).toHaveLength(2)
     })
   })
 

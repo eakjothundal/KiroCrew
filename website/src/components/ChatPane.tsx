@@ -1802,6 +1802,7 @@ export default function ChatPane({
           pasteBlocks={pasteBlocks}
           onPasteBlocksChange={setPasteBlocks}
           onSend={doSend}
+          terminalCommands={paneSlot?.executor === 'remote' ? 'remote' : 'local'}
           isRunning={busy}
           onStop={onStop}
           isQueued={streamState === 'stopping' || !!paneSlot?.stopping}

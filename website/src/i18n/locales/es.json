@@ -6112,6 +6112,7 @@
       "let_the_agent_read_one_of_your_files": "Permite que el agente lea uno de tus archivos",
       "message_input": "Campo de mensaje",
       "message_placeholder": "Enviar mensaje a {{bot}}… (/command · @file · $skill)",
+      "message_placeholder_terminal": "Terminal: ! command (espacio después de !) · Mensaje a {{bot}}… (/command · @file · $skill)",
       "model": "Modelo",
       "model_2": "Modelo: {{name}}",
       "open_preview_of": "Abrir la vista previa de {{name}}",
@@ -6194,7 +6195,16 @@
       "session_control_ready": "Listo",
       "session_control_chip_label": "{{label}} — {{detail}}",
       "agent_inherited_default": "Esta sesión sigue el agente predeterminado ({{name}}). No tiene un agente propio, así que cambia si cambia el predeterminado. Haz clic para fijar uno.",
-      "model_inherited_default": "Esta sesión usa el modelo predeterminado ({{name}}). No tiene un modelo propio, así que cambia si cambia el predeterminado. Haz clic para fijar uno."
+      "model_inherited_default": "Esta sesión usa el modelo predeterminado ({{name}}). No tiene un modelo propio, así que cambia si cambia el predeterminado. Haz clic para fijar uno.",
+      "terminal_attachments": "Quita los archivos adjuntos antes de ejecutar un comando de terminal.",
+      "terminal_default_directory": "directorio predeterminado del terminal",
+      "terminal_empty": "Escribe un comando después de !.",
+      "terminal_failed": "No se pudo enviar el comando. Revisa el espacio de trabajo seleccionado y la configuración del terminal e inténtalo de nuevo.",
+      "terminal_hint": "Terminal · {{workspace}} · Se ejecuta sin el agente",
+      "terminal_invalid_cwd": "Ese espacio de trabajo ya no existe. Selecciona uno existente y vuelve a ejecutar el comando.",
+      "terminal_main_window": "Abre esta sesión en la ventana principal para ejecutar comandos de terminal.",
+      "terminal_remote": "Los comandos de terminal no están disponibles en sesiones de equipos remotos.",
+      "terminal_unavailable": "El terminal está desactivado para esta puerta de enlace."
     },
     "chatPane": {
       "agent_list": "Lista de agentes",
@@ -6224,6 +6234,7 @@
       "disconnected_message": "Terminal desconectada",
       "displaced_message": "Otra ventana tomó el control de esta terminal",
       "failed_retry": "Error — reintentar",
+      "invalid_cwd_message": "El directorio de trabajo del terminal no existe. Restáuralo y vuelve a conectarte, o abre un terminal en otro directorio.",
       "reconnect": "Reconectar",
       "reconnecting": "Reconectando…",
       "redaction_failed_retry": "Error al censurar — reintentar",

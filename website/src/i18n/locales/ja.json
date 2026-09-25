@@ -5920,6 +5920,7 @@
       "let_the_agent_read_one_of_your_files": "エージェントにファイルを読み込ませる",
       "message_input": "メッセージ入力",
       "message_placeholder": "{{bot}} にメッセージ… (/command · @file · $skill)",
+      "message_placeholder_terminal": "ターミナル: ! command（! の後にスペース）· {{bot}} にメッセージ… (/command · @file · $skill)",
       "model": "モデル",
       "model_2": "モデル：{{name}}",
       "open_preview_of": "{{name}} のプレビューを開く",
@@ -6002,7 +6003,16 @@
       "session_control_ready": "準備完了",
       "session_control_chip_label": "{{label}} — {{detail}}",
       "agent_inherited_default": "このセッションはデフォルトエージェント（{{name}}）に従います。独自のエージェントを持たないため、デフォルトが変わると変わります。固定するにはクリックしてください。",
-      "model_inherited_default": "このセッションはデフォルトモデル（{{name}}）で動作します。独自のモデルを持たないため、デフォルトが変わると変わります。固定するにはクリックしてください。"
+      "model_inherited_default": "このセッションはデフォルトモデル（{{name}}）で動作します。独自のモデルを持たないため、デフォルトが変わると変わります。固定するにはクリックしてください。",
+      "terminal_attachments": "ターミナルコマンドを実行する前に添付ファイルを削除してください。",
+      "terminal_default_directory": "ターミナルの既定ディレクトリ",
+      "terminal_empty": "! の後にコマンドを入力してください。",
+      "terminal_failed": "コマンドを送信できませんでした。選択したワークスペースとターミナル設定を確認して、もう一度お試しください。",
+      "terminal_hint": "ターミナル · {{workspace}} · エージェントを介さず実行",
+      "terminal_invalid_cwd": "このワークスペースは存在しません。既存のワークスペースを選択して、コマンドをもう一度実行してください。",
+      "terminal_main_window": "ターミナルコマンドを実行するには、このセッションをメインウィンドウで開いてください。",
+      "terminal_remote": "リモートクルーのセッションではターミナルコマンドを利用できません。",
+      "terminal_unavailable": "このゲートウェイではターミナルが無効になっています。"
     },
     "chatPane": {
       "agent_list": "エージェントリスト",
@@ -6032,6 +6042,7 @@
       "disconnected_message": "ターミナルが切断されました",
       "displaced_message": "別のウィンドウがこのターミナルを引き継ぎました",
       "failed_retry": "失敗 — 再試行",
+      "invalid_cwd_message": "ターミナルの作業ディレクトリが存在しません。復元して再接続するか、別のディレクトリでターミナルを開いてください。",
       "reconnect": "再接続",
       "reconnecting": "再接続しています…",
       "redaction_failed_retry": "編集に失敗しました — 再試行",

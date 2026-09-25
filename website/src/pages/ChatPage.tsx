@@ -7658,6 +7658,7 @@ export default function ChatPage({ mode, embedded, embedMode, popout, noUrlSync 
               // signal that arms the prefill hint's expiry.
               onChange={v => { clearFollowUpOwnership(); setInput(v); setPrefillEdited(true) }}
               onSend={() => send()}
+              terminalCommands={currentSlot?.executor === 'remote' ? 'remote' : 'local'}
               canSteer={composerBusy}
               onSteer={steer}
               // AND a turn actually running. `composerBusy` is also true when only

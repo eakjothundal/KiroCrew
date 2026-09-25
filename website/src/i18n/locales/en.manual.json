@@ -1869,6 +1869,7 @@
       "branch": "Branch: {{branch}}",
       "detached_head_at": "Detached HEAD at {{branch}}",
       "message_placeholder": "Message {{bot}}… (/command · @file · $skill)",
+      "message_placeholder_terminal": "Terminal: ! command (space after !) · Message {{bot}}… (/command · @file · $skill)",
       "approve": "Approve",
       "approve_all": "Approve all",
       "could_not_submit_that_decision_see_the_console_f": "Could not submit that decision — see the console for details.",
@@ -1920,7 +1921,16 @@
       "optimize_failed_elsewhere": "Couldn't optimize the prompt you started in another session. Its original text was restored there.",
       "session_control_needs_attention": "Needs attention",
       "session_control_ready": "Ready",
-      "session_control_chip_label": "{{label}} — {{detail}}"
+      "session_control_chip_label": "{{label}} — {{detail}}",
+      "terminal_hint": "Terminal · {{workspace}} · Runs without the agent",
+      "terminal_default_directory": "default terminal directory",
+      "terminal_failed": "Could not send the command. Check the selected workspace and terminal settings, then try again.",
+      "terminal_unavailable": "Terminal is disabled for this gateway.",
+      "terminal_invalid_cwd": "That workspace no longer exists. Select an existing workspace, then run the command again.",
+      "terminal_main_window": "Open this session in the main window to run terminal commands.",
+      "terminal_remote": "Terminal commands are unavailable for remote crew sessions.",
+      "terminal_attachments": "Remove attachments before running a terminal command.",
+      "terminal_empty": "Type a command after !."
     },
     "chatPane": {
       "crewmate_quiet": "{{name}} hasn't said anything to you yet.",
@@ -1941,6 +1951,7 @@
       "disconnected_message": "Terminal disconnected",
       "displaced_message": "Another window took over this terminal",
       "failed_retry": "Failed — retry",
+      "invalid_cwd_message": "The terminal working directory does not exist. Restore it and reconnect, or open a terminal in another directory.",
       "reconnect": "Reconnect",
       "reconnecting": "Reconnecting…",
       "redaction_failed_retry": "Redaction failed — retry",

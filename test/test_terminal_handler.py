@@ -68,6 +68,7 @@ def _make_request(
     request.match_info.get = lambda k, default="": session_id if k == "session_id" else default
     request.remote = remote
     request.headers = {} if origin is None else {"Origin": origin}
+    request.query = {}
     return request
 
 
@@ -420,6 +421,32 @@ class TestGetConfig:
 
 
 class TestResolveCwd:
+    @pytest.fixture
+    def invalid_workspace(self, tmp_path, monkeypatch):
+        registry = {}
+        request = _make_request(registry=registry)
+        request.query = {"cwd": str(tmp_path / "missing")}
+        ws = MagicMock(spec=web.WebSocketResponse)
+        ws.closed = False
+        ws.prepare = AsyncMock()
+        ws.send_str = AsyncMock()
+        ws.close = AsyncMock()
+        monkeypatch.setattr(terminal, "_get_config", lambda _: {"cwd": str(tmp_path)})
+        monkeypatch.setattr(
+            terminal, "_resolve_shell_with_fence_shells",
+            lambda _: ("/bin/sh", None, {}),
+        )
+        monkeypatch.setattr(terminal.web, "WebSocketResponse", lambda **_: ws)
+        # Fail before allocating a POSIX PTY or preparing either spawn's env.
+        pty = MagicMock()
+        pty.openpty.side_effect = AssertionError("unexpected PTY allocation")
+        monkeypatch.setattr(terminal, "_pty", pty)
+        monkeypatch.setattr(
+            terminal, "_pty_child_env",
+            MagicMock(side_effect=AssertionError("unexpected shell spawn")),
+        )
+        return request, registry, ws
+
     def test_valid_requested_dir_wins(self, tmp_path):
         assert terminal._resolve_cwd({"cwd": "/etc"}, str(tmp_path)) == str(tmp_path)
 
@@ -430,8 +457,63 @@ class TestResolveCwd:
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
         assert terminal._resolve_cwd({}, "~") == str(tmp_path)
 
-    def test_invalid_requested_falls_back_to_config_cwd(self, tmp_path):
-        assert terminal._resolve_cwd({"cwd": str(tmp_path)}, "/no/such/dir/xyz") == str(tmp_path)
+    def test_invalid_requested_refuses_another_directory(self, tmp_path):
+        with pytest.raises(ValueError, match="working directory"):
+            terminal._resolve_cwd({"cwd": str(tmp_path)}, str(tmp_path / "missing"))
+
+    @pytest.mark.parametrize("windows", [False, True])
+    @pytest.mark.asyncio
+    async def test_invalid_workspace_reports_error_without_spawning(
+        self, invalid_workspace, monkeypatch, windows,
+    ):
+        request, registry, ws = invalid_workspace
+        monkeypatch.setattr(terminal.platform_compat, "IS_WINDOWS", windows)
+
+        async def check_reserved(*_args):
+            assert registry == {"abc123": None}
+
+        ws.prepare.side_effect = check_reserved
+        ws.close.side_effect = check_reserved
+        response = await terminal.api_terminal_ws(request)
+        assert response is ws
+        ws.prepare.assert_awaited_once_with(request)
+        ws.send_str.assert_awaited_once()
+        assert json.loads(ws.send_str.call_args.args[0]) == {
+            "type": "error",
+            "code": "terminal_invalid_cwd",
+            "message": "Terminal working directory does not exist",
+        }
+        ws.close.assert_awaited_once()
+        assert registry == {}
+        terminal._pty.openpty.assert_not_called()
+        terminal._pty_child_env.assert_not_called()
+
+    @pytest.mark.parametrize("stage", ["prepare", "send_str", "close"])
+    @pytest.mark.asyncio
+    async def test_invalid_workspace_cancellation_releases_reservation(
+        self, invalid_workspace, stage,
+    ):
+        request, registry, ws = invalid_workspace
+        getattr(ws, stage).side_effect = asyncio.CancelledError
+        with pytest.raises(asyncio.CancelledError):
+            await terminal.api_terminal_ws(request)
+        assert registry == {}
+
+    @pytest.mark.parametrize("stage", ["send_str", "close"])
+    @pytest.mark.asyncio
+    async def test_invalid_workspace_response_is_bounded(
+        self, invalid_workspace, monkeypatch, stage,
+    ):
+        request, registry, ws = invalid_workspace
+
+        async def blocked(*_args):
+            await asyncio.Event().wait()
+
+        getattr(ws, stage).side_effect = blocked
+        monkeypatch.setattr(terminal, "_TERMINAL_WS_CLEANUP_TIMEOUT_S", 0.01)
+        assert await asyncio.wait_for(terminal.api_terminal_ws(request), timeout=5) is ws
+        ws.close.assert_awaited_once()
+        assert registry == {}
 
     def test_no_request_uses_config_cwd(self, tmp_path):
         assert terminal._resolve_cwd({"cwd": str(tmp_path)}, None) == str(tmp_path)
@@ -3760,6 +3842,29 @@ class TestTerminalWsIntegration:
             await terminal._kill_session(registry["cwd-memo-sess"])
 
     @pytest.mark.asyncio
+    async def test_invalid_workspace_error_reaches_websocket_client(self, monkeypatch, tmp_path):
+        from aiohttp.test_utils import TestClient, TestServer
+
+        registry: dict = {}
+        spawn = MagicMock(side_effect=AssertionError("invalid cwd must not spawn"))
+        monkeypatch.setattr(terminal, "_pty", MagicMock(openpty=spawn))
+        monkeypatch.setattr(terminal, "_pty_child_env", spawn)
+        async with TestClient(TestServer(_make_app(registry=registry))) as client:
+            async with client.ws_connect(
+                "/api/ws/terminal/invalid-workspace",
+                params={"cwd": str(tmp_path / "missing")},
+            ) as ws:
+                frame = await ws.receive_json(timeout=3)
+                assert frame == {
+                    "type": "error",
+                    "code": "terminal_invalid_cwd",
+                    "message": "Terminal working directory does not exist",
+                }
+                assert (await ws.receive(timeout=3)).type == web.WSMsgType.CLOSE
+        assert registry == {}
+        spawn.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_ws_reconnect_existing_session(self, monkeypatch, tmp_path):
         """Reconnect to an existing PTY session."""
         cfg_file = tmp_path / "config.json"
@@ -3784,8 +3889,12 @@ class TestTerminalWsIntegration:
             # browser must receive the same readiness state after replay.
             sess.shell_ready = True
 
-            # Reconnect
-            async with client.ws_connect("/api/ws/terminal/recon-sess") as ws:
+            # A live PTY keeps its cwd even if the browser's saved project path
+            # is missing. Validation applies only when spawning a shell.
+            async with client.ws_connect(
+                "/api/ws/terminal/recon-sess",
+                params={"cwd": str(tmp_path / "missing")},
+            ) as ws:
                 sess = registry["recon-sess"]
                 assert terminal._sess_pid(sess) == original_pid  # same PTY
                 assert sess.ws is not None  # reconnected
@@ -4681,6 +4790,8 @@ class TestTerminalWsIntegration:
                 type("R", (), {"app": client.app})()  # type: ignore[arg-type]
             )
             registry[sid] = _make_session(session_id=sid)
+            # No PTY was spawned; a fake descriptor could close the test server.
+            registry[sid].master_fd = -1  # wokeignore:rule=master
             resp = await client.delete(f"/api/terminal/sessions/{sid}")
             assert resp.status == 200
             body = await resp.json()
