@@ -560,11 +560,105 @@ async def test_a_released_start_that_is_stopped_while_waiting_never_runs() -> No
             await mgr._force_reap(third.id, live, 1.0, reason="user_stop")
             await _settle()
             assert live.done is True
+            # A stop is a stop, not a rejection: the reap owns the record and
+            # the release path writes nothing over it.
+            assert live.user_stopped is True
+            assert "spawn rejected" not in live.error
             assert not mgr._queue  # the entry went with it
             runs.progress(mgr, first)
             await _settle()
             assert runs.started == [first.id, second.id]  # never metered in
         finally:
+            await _close(mgr, runs)
+
+
+@pytest.mark.asyncio
+async def test_a_reap_while_waiting_is_announced_as_a_reap_not_a_rejection() -> None:
+    """Same wait, ended by the watchdog's reap instead of a stop: the error
+    names the interrupted wait (the reap's own vocabulary), the spawn is never
+    recorded as started, and no ``rejected`` audit is written."""
+    pending: dict[str, asyncio.Future] = {}
+    trusted: list = []
+    with _StartupRuns() as runs:
+        mgr = _manager(max_concurrent=8, gate_width=1)
+        mgr._spawn_stagger_secs = 0.0
+        _interactive(mgr, pending, trusted)
+        mgr._sessions.reset = AsyncMock()
+        mgr._sigkill_session = AsyncMock()  # type: ignore[method-assign]
+        mgr._write_tombstone = MagicMock()  # type: ignore[method-assign]
+        mgr._record_cost = MagicMock()  # type: ignore[method-assign]
+        mgr._fire_event = AsyncMock()  # type: ignore[method-assign]
+        mgr._log_spawned = MagicMock()  # type: ignore[method-assign]
+        await mgr.wait_taskq_ready()
+        try:
+            first, second, third = [await _spawn(mgr, f"p-{i}") for i in range(3)]
+            trusted.append(True)
+            for fut in list(pending.values()):
+                fut.set_result(True)
+            await _settle()
+            assert runs.started == [first.id, second.id]
+            live = mgr._agents[third.id]
+            assert live._start_release is not None
+            # Only the two starts that actually ran are recorded as spawned.
+            assert [c.args[0].id for c in mgr._log_spawned.call_args_list] == [first.id, second.id]
+
+            with patch("kiro_crew.subagent.sel") as sel_mock:
+                await mgr._force_reap(third.id, live, 300.0, reason="timeout")
+                await _settle()
+                audited = [
+                    c.kwargs.get("outcome")
+                    for c in sel_mock.return_value.log_tool_invocation.call_args_list
+                ]
+            assert live.done is True and live.reaped is True
+            assert "waiting to be admitted into startup after spawn approval" in live.error
+            assert "spawn rejected" not in live.error
+            assert "rejected" not in audited
+            assert [c.args[0].id for c in mgr._log_spawned.call_args_list] == [first.id, second.id]
+        finally:
+            await _close(mgr, runs)
+
+
+@pytest.mark.asyncio
+async def test_admission_closed_at_release_refuses_the_approved_start() -> None:
+    """The prompt resolves after the updater closed gateway admission: the
+    start is refused with its own rejection (slot released, ``rejected`` /
+    ``admission_closed`` audited, parent announced), is never recorded as
+    spawned, and never runs."""
+    pending: dict[str, asyncio.Future] = {}
+    trusted: list = []
+    announced: list = []
+
+    async def _on_done(info):  # noqa: ANN001
+        announced.append(info)
+
+    with _StartupRuns() as runs:
+        mgr = _manager(max_concurrent=8, gate_width=1)
+        mgr._spawn_stagger_secs = 0.0
+        _interactive(mgr, pending, trusted)
+        mgr._on_done = _on_done
+        mgr._log_spawned = MagicMock()  # type: ignore[method-assign]
+        await mgr.wait_taskq_ready()
+        try:
+            only = await _spawn(mgr, "late")
+            assert mgr._running_count == 1
+            mgr._sessions.admission_closed = True
+            with patch("kiro_crew.subagent.sel") as sel_mock:
+                pending.pop(f"spawn:{only.id}").set_result(True)
+                await _settle()
+                reasons = [
+                    c.kwargs.get("metadata", {}).get("reason")
+                    for c in sel_mock.return_value.log_tool_invocation.call_args_list
+                    if c.kwargs.get("outcome") == "rejected"
+                ]
+            live = mgr._agents[only.id]
+            assert runs.started == []
+            assert live.done is True and "gateway closed admission" in live.error
+            assert reasons == ["admission_closed"]
+            assert mgr._running_count == 0
+            assert [a.id for a in announced] == [only.id]
+            mgr._log_spawned.assert_not_called()
+        finally:
+            mgr._sessions.admission_closed = False
             await _close(mgr, runs)
 
 
@@ -698,6 +792,97 @@ async def test_reaper_sweep_reaps_at_the_base_deadline_under_a_crowd(monkeypatch
 
     assert reaped == [("wedged", "startup_timeout")]
     assert fresh.done is False
+
+
+# ── Leaving startup takes a produced event, not an opened stream ───────────
+
+
+class TestStreamOpenIsNotProgress:
+    @staticmethod
+    def _sessions_with_stream(stream_factory) -> MagicMock:
+        provider = AsyncMock()
+        provider.start = AsyncMock()
+        provider.shutdown = AsyncMock()
+        provider.context_usage_pct = lambda: 0.0
+        provider.context_used_tokens = MagicMock(return_value=0)
+        provider.context_window_tokens = MagicMock(return_value=0)
+        provider.stream = MagicMock(side_effect=stream_factory)
+        sessions = mock_sessions()
+        sessions.get_or_create = AsyncMock(return_value=(provider, True, False))
+        sessions.record_success = MagicMock()
+        return sessions
+
+    @pytest.mark.asyncio
+    async def test_a_stream_that_opens_and_yields_nothing_is_still_reaped(self) -> None:
+        """A provider whose ``stream()`` is entered but never yields is a start
+        that is not starting: it stays in startup (``_in_startup`` True, no
+        first-stream stamp, no pump wake) and the watchdog reaps it at the base
+        deadline. Stamping at stream open would let exactly this hang evade
+        both."""
+        from kiro_crew.execution_context import execution_for_store
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        opened = asyncio.Event()
+        never = asyncio.get_event_loop().create_future()
+
+        async def _hung_stream(*_a, **_k):
+            opened.set()
+            await never
+            yield  # pragma: no cover -- unreachable
+
+        sessions = self._sessions_with_stream(_hung_stream)
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("message", None))
+        ctx.hooks.auto_approve_subagent_tools = False
+        mgr = SubagentManager(sessions=sessions, ctx_builder=ctx, startup_timeout=120)
+        mgr._should_use_session_sharing = MagicMock(return_value=False)  # type: ignore[method-assign]
+        mgr._note_startup_progress = MagicMock()  # type: ignore[method-assign]
+        info = _info("f00d1234", execution_context=execution_for_store(""))
+        info.model = "gpt-5.6-sol"
+        _register(mgr, info)
+        await asyncio.to_thread(
+            create_agent_folder, info.id, execution_context=info.execution_context
+        )
+        task = asyncio.ensure_future(mgr._run_inner(info, "subagent:f00d1234"))
+        try:
+            await asyncio.wait_for(opened.wait(), 5.0)
+            await _settle()
+            assert info._exec_started is not None
+            assert info._first_stream_started is None
+            assert SubagentManager._in_startup(info) is True
+            mgr._note_startup_progress.assert_not_called()
+            assert mgr._is_startup_stalled(info, now=info._exec_started + 120.5) is True
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_the_first_event_received_leaves_startup(self) -> None:
+        """The counterpart: one event out of the stream stamps the marker,
+        takes the run out of startup and wakes the pump once."""
+        from kiro_crew.execution_context import execution_for_store
+        from kiro_crew.providers.base import EVENT_COMPLETE
+        from kiro_crew.subagent_persistence import create_agent_folder
+
+        async def _one_event(*_a, **_k):
+            yield SimpleNamespace(kind=EVENT_COMPLETE, stop_reason="end_turn", runtime_global=False)
+
+        sessions = self._sessions_with_stream(_one_event)
+        ctx = MagicMock()
+        ctx.build_message = MagicMock(return_value=("message", None))
+        ctx.hooks.auto_approve_subagent_tools = False
+        mgr = SubagentManager(sessions=sessions, ctx_builder=ctx, startup_timeout=120)
+        mgr._should_use_session_sharing = MagicMock(return_value=False)  # type: ignore[method-assign]
+        mgr._note_startup_progress = MagicMock()  # type: ignore[method-assign]
+        info = _info("f00d5678", execution_context=execution_for_store(""))
+        info.model = "gpt-5.6-sol"
+        _register(mgr, info)
+        await asyncio.to_thread(
+            create_agent_folder, info.id, execution_context=info.execution_context
+        )
+        await mgr._run_inner(info, "subagent:f00d5678")
+        assert info._first_stream_started is not None
+        mgr._note_startup_progress.assert_called_once_with(info)
 
 
 # ── Gate-exit start-clock reset on the DEDICATED-process path ─────────────

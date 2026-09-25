@@ -1808,22 +1808,27 @@ class RunEventCoordinator(ManagerComponent):
                     msg = _TRANSIENT_CONTINUE_MSG if _had_activity else full_message
 
         _complete_event: LLMEvent | None = None
-        # Wall clock for THIS subagent's own turn. Deliberately started here,
-        # at the subagent's own stream, not on the parent side: under session
-        # sharing this subagent reuses the parent's runtime, so a parent-side
-        # clock would charge the child for the parent's elapsed time. acp
-        # leaves TurnUsage.duration_ms at 0, so the row needs this.
-        # Includes transient-retry backoff, which is real wall time the caller
-        # waited for this turn.
-        info._first_stream_started = time.time()
-        # The last way out of startup that is not a PID (a provider may create
-        # its child lazily from ``stream()``, so a run can reach here with
-        # ``_pid`` still None): wake a spawn the in-startup bound is holding.
-        # Only the FIRST turn's stream is a transition; this line runs per turn.
-        if info.turns == 0:
-            self._manager._note_startup_progress(info)
         _turn_t0 = time.monotonic()
+        _turn_streamed = False
         async for event in _stream_with_transient_retry():
+            if not _turn_streamed:
+                _turn_streamed = True
+                # The stream has PRODUCED something -- stamped on the first
+                # event received, not when the stream is opened: an open
+                # stream that never yields is a start that is not starting,
+                # and the startup watchdog (``_is_startup_stalled``), the
+                # in-startup bound (``_in_startup``) and the adaptive
+                # controller all read this marker as "past startup". Under
+                # session sharing this subagent reuses the parent's runtime,
+                # so the stamp is taken here, on the child's own stream, not
+                # on the parent side. Re-stamped per turn.
+                info._first_stream_started = time.time()
+                # The last way out of startup that is not a PID (a provider may
+                # create its child lazily from ``stream()``, so a run can reach
+                # here with ``_pid`` still None): wake a spawn the in-startup
+                # bound is holding. Only the FIRST turn is a transition.
+                if info.turns == 0:
+                    self._manager._note_startup_progress(info)
             # Refresh the activity clock for every event kind that BELONGS to
             # this session (thinking chunks, tool-call updates, etc.) before
             # dispatch, so idle-stall detection only trips on a genuine no-event

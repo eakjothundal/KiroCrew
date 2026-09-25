@@ -359,9 +359,17 @@ invariants:
   the stagger, so the resume grants run whether a start was released or is
   being held (pinned by `test_a_held_release_does_not_starve_a_queued_resume`);
   the fresh-spawn pick applies the same two checks itself, so a hold here holds
-  it too. A start whose prompt resolves while gateway admission is closed is
-  refused at release (`spawn rejected: the gateway closed admission ...`) --
-  the same guard every registration in the admission package sits behind; a stop or reap while waiting wakes it with False and drops
+  it too. `_admit_released_start` answers `"admitted"`, `"admission_closed"`
+  or `"ended"`, and `_spawn_with_approval` treats each for what it is: an
+  admitted start is recorded as spawned (`_log_spawned`, only now -- a start
+  refused or ended while waiting is never counted) and run; a start whose
+  prompt resolves while gateway admission is closed is refused at release
+  (`spawn rejected: the gateway closed admission ...`, `rejected` /
+  `admission_closed` audited, parent announced) -- the same guard every
+  registration in the admission package sits behind; a start ended by a user
+  stop or a reap while it waited writes nothing, since `_force_reap` owns that
+  record (a stop is neutral, a reap names the interrupted wait) and its
+  announce; a stop or reap while waiting wakes it with False and drops
   the entry, and a slow self-re-arming re-pump (`_RELEASE_REPUMP_SECS`) backs
   the edge-driven wake. Pinned by
   `test_bulk_approval_cannot_release_more_than_the_startup_cap` and
@@ -392,7 +400,7 @@ invariants:
   no timer: a held
   drain arms nothing, because every edge that frees a startup slot already pumps --
   `_note_startup_progress` from `_run_inner` at the PID record and the first
-  stream, and the slot-release drain on every terminal, including the
+  stream event, and the slot-release drain on every terminal, including the
   watchdog's reap of a wedged start, so a wedged population cannot hold the
   queue past its reap. Pinned by `test_subagent_startup_pressure.py`.
 - **Lowering the cap cancels nothing.** In-flight runs keep going; the gate
@@ -991,7 +999,7 @@ An unmarked `CancelledError` (see intentional-cancel rule) triggers `_schedule_c
 - `_reaper_loop`: sweeps every 60s, calls `_force_reap` on expired agents
 - **taskq pump** (`OrphanStallMonitor.taskq_pump`, facade `_taskq_pump`): `start_reaper` runs it once after `taskq_boot_dispatch` (building the manager's `DependencyCoordinator` from `agent.dependency_*` over the admission store, `capacity = _max_concurrent`, and running `coordinator.rebuild()` after `open_default_store` ran `WaitLedger.rebuild()`), every sweep re-runs it as the backstop, and every run that parks on a wait calls it. One pass = `admission.taskq_expire_waits()` (wait deadlines) + `coordinator.tick()` (due scopes) + a one-shot `loop.call_later` re-armed at `coordinator.next_deadline()`, so a scope is woken when it is due, not on the next 60s sweep. The coordinator is registered process-wide (`taskq.dependency.register_coordinator`) for the main chat's read of scope schedules. Terminal runs call `coordinator.forget(id)` from `_run`'s finally (a finished probe is the scope's recovery signal) and withdraw any pending resume entry.
 - `_force_reap`: reset with 30s timeout → SIGKILL fallback → mark done → fire `subagent_done` WS event
-- **Startup-stall admission ends when the first provider stream begins.** A provider may create its child process lazily from `stream()`, so a missing PID before the first response is not proof that execution never started. The marker resets for every recovery execution; the startup watchdog may reap only a subagent with no first stream, no runtime PID, and no completed turn. The ordinary wall-clock deadline remains unchanged.
+- **Startup-stall admission ends when the first provider stream EVENT is received, not when the stream is opened.** A provider may create its child process lazily from `stream()`, so a missing PID before the first response is not proof that execution never started -- but an opened stream that has yielded nothing is not proof of progress either: `_first_stream_started` is stamped on the first event out of the stream, so a stream that opens and hangs keeps the run in startup (`_in_startup`) and reapable (pinned by `TestStreamOpenIsNotProgress`). The marker resets for every recovery execution; the startup watchdog may reap only a subagent with no first stream event, no runtime PID, and no completed turn. The ordinary wall-clock deadline remains unchanged.
 - **The startup deadline is fixed; the clock starts at gate exit.** `_is_startup_stalled` compares `now - _exec_started` against the bare `_startup_deadline` however many other agents are `_in_startup`. The crowd is handled at the two ends of the start, not in the deadline: `_gate_exit_reset` moves `_exec_started` to `SessionStartGate` exit on both start paths, so the deadline measures time spent starting with a permit held, and the in-startup population is bounded at admission (`_startup_cap`). The deadline is deliberately NOT pressure-aware (no term per other agent in startup): with queue time uncharged and the crowd bounded there is no evidence that a healthy start misses the base deadline, and a term sampled at sweep time against a clock spanning the whole crowded period would not be monotonic -- it would shrink as the crowd drained and could reap at one sweep an agent the sweep before had left inside its window. The reaper's warning names the in-startup population, as diagnostics only. Pinned by `test_subagent_startup_pressure.py` and `test_subagent_startup_watchdog.py`.
 - **Terminal completion is arbitrated by FOUR separate guards, not by `reaped` alone.** Two paths can finish a subagent — `_force_reap` and `_run`'s `finally` — and between them there are four distinct one-time concerns. Earlier revisions tried to arbitrate them with `reaped` plus `done` and every attempt satisfied two while breaking a third (duplicate delivery when the marker was set late; a lost outcome when it was set early and the reaper was cancelled; a lost outcome when the claim was handed back to a run that had already exited; and finally **no reporter at all plus a leaked concurrency slot** when the report claim was gated on `not info.done`). The guards are now:
   1. **`info.reaped` — classification.** Was this a deliberate reap? The cancel-recovery scheduler reads it, and the marker MUST precede the intentional cancel (see the intentional-cancel rule above) or an unexpected-cancel respawn fires on the run being killed. Unchanged.

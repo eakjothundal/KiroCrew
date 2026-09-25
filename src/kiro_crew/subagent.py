@@ -583,7 +583,7 @@ _STARTUP_TIMEOUT_SECS = 120  # max seconds a subagent may sit pre-first-turn wit
 _STARTUP_CAP_GATE_ROUNDS = 2
 # How often a start released from the spawn-approval prompt re-pumps while it
 # waits for the in-startup bound (``_admit_released_start``). A backstop behind
-# the edges that pump anyway (PID, first stream, terminal, stagger boundary),
+# the edges that pump anyway (PID, first stream event, terminal, stagger boundary),
 # so it is slow.
 _RELEASE_REPUMP_SECS = 1.0
 _ON_DONE_TIMEOUT = 1200.0  # outer cap: max total seconds for semaphore wait + injection
@@ -3913,8 +3913,8 @@ class SubagentManager:
     def _note_startup_progress(self, info: SubagentInfo) -> None:
         """Wake the spawn queue when *info* leaves startup without ending.
 
-        A runtime PID or a first provider stream takes *info* out of the
-        in-startup population, which may open a slot under :meth:`_startup_cap`
+        A runtime PID or the first event out of the provider stream takes
+        *info* out of the in-startup population, which may open a slot under :meth:`_startup_cap`
         that no other edge announces: the slot-release drain fires only on a
         terminal, and the pump does not poll. Called from ``_run_inner`` at
         those two transitions -- at most twice per start -- and the pump
@@ -4523,7 +4523,7 @@ class SubagentManager:
     def _drain_queue(self) -> None:
         return self._admission._drain_queue_impl()
 
-    async def _admit_released_start(self, info: SubagentInfo) -> bool:
+    async def _admit_released_start(self, info: SubagentInfo) -> str:
         return await self._admission._admit_released_start_impl(info)
 
     def _release_admitted_start(self) -> str:
