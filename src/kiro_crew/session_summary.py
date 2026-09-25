@@ -244,6 +244,32 @@ def render_input(turns: list[TranscriptTurn]) -> str:
     return "\n".join(lines).strip()
 
 
+# Over budget, a session keeps its opening goals and newest turns, not its middle.
+_MAX_INPUT_CHARS = 40_000
+_KEEP_FIRST_TURNS = 3
+
+
+def render_bounded_input(turns: list[TranscriptTurn], max_chars: int = _MAX_INPUT_CHARS) -> str:
+    """:func:`render_input` under *max_chars*: a marker for the middle, long turns cut."""
+    if len(render_input(turns)) <= max_chars:
+        return render_input(turns)
+    blocks = [_excerpt(render_input([turn]), max_chars // 8) for turn in turns]
+    head: list[str] = []
+    for turn, block in zip(turns, blocks):
+        if (turn.user_turn or 0) > _KEEP_FIRST_TURNS:
+            break
+        if len("".join([*head, block])) > max_chars // 2:
+            break
+        head.append(block)
+    tail: list[str] = []
+    for block in reversed(blocks[len(head) :]):
+        if len("\n\n".join([*head, block, *tail])) + 64 > max_chars:
+            break
+        tail.insert(0, block)
+    marker = f"[... {len(blocks) - len(head) - len(tail)} turns omitted ...]"
+    return "\n\n".join([*head, marker, *tail])
+
+
 # ---------------------------------------------------------------------------
 # Payload shaping
 # ---------------------------------------------------------------------------

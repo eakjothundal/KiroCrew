@@ -180,6 +180,14 @@ to 50; a long list stops being read. Durable cross-session preferences belong in
 Measured against three real sessions, this reads roughly 1% of a transcript's
 bytes.
 
+`render_bounded_input()` then caps the whole prompt input at `_MAX_INPUT_CHARS`
+(40 000). A session under it renders unchanged. Over it, the input keeps the turns
+through the first `_KEEP_FIRST_TURNS` (3) user turns and as many of the newest
+turns as fit, and one `[... N turns omitted ...]` line stands in for the middle;
+any single turn keeps its head and tail, about a quarter of the budget. The trade is deliberate: the
+opening goals and the current state stay in view, and an intent that lived only
+in the dropped middle can fall out of a regenerated summary.
+
 ### Mechanically detectable traps live here
 
 Two transcript shapes reliably produce a wrong summary and are both detectable
@@ -237,7 +245,8 @@ restore), so summarizing the in-memory tail of a long session would regenerate
 from a truncated view and overwrite the sidecar — earlier intents would silently
 vanish from the panel. The generator reads `read_messages_chained()` off the event
 loop; the cheap slot-level gates (disabled, unclean stop) run first so the common
-skip cases cost no disk IO, and `extract_turns` still bounds what the model reads.
+skip cases cost no disk IO, and `extract_turns` plus `render_bounded_input` bound
+what the model reads.
 
 **An unchanged transcript costs nothing.** Before any model call the pass checks
 the sidecar; a valid signature means the stored summary is already exactly right.
