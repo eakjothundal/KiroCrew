@@ -9331,7 +9331,9 @@ async def _run_chat(
                 extra_hooks=_spec_hooks,
                 extra_hooks_cwd=_spec_hooks_cwd,
                 extra_hooks_tool_names=(
-                    spec_hook_tool_names(tool_id) if _spec_hooks and tool_id is not None else None
+                    spec_hook_tool_names(tool_id, _spec_hooks)
+                    if _spec_hooks and tool_id is not None
+                    else None
                 ),
             )
             for r in results:

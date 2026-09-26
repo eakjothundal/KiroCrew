@@ -42,8 +42,10 @@ from kiro_crew.providers.base import EVENT_COMPLETE, EVENT_PERMISSION_REQUEST, L
 @pytest.fixture(autouse=True)
 def _fresh_cache():
     spec_hooks._cache.clear()
+    spec_hooks._unknown_tool_ids.clear()
     yield
     spec_hooks._cache.clear()
+    spec_hooks._unknown_tool_ids.clear()
 
 
 # ── The table ──
@@ -55,8 +57,9 @@ def test_the_translation_table_serves_only_kas():
 
 
 def test_a_kas_shell_call_answers_to_its_kiro_cli_name():
-    assert kas_tool_match_names("run_command") == ("run_command", "execute_bash")
-    assert kas_tool_match_names("str_replace") == ("str_replace", "fs_write")
+    assert kas_tool_match_names("run_command") == ("run_command", "execute_bash", "shell")
+    assert kas_tool_match_names("str_replace") == ("str_replace", "fs_write", "write")
+    assert kas_tool_match_names("fs_write") == ("fs_write", "write")
     assert kas_tool_match_names("") == ()
 
 
@@ -120,7 +123,7 @@ def _pre_tool_hooks(matcher: str) -> list[ScriptHook]:
     )
 
 
-@pytest.mark.parametrize("matcher", ["execute_bash", "run_command", "fs_*", "*"])
+@pytest.mark.parametrize("matcher", ["execute_bash", "shell", "run_command", "fs_*", "*"])
 def test_a_matcher_naming_a_tool_kas_runs_is_kept(matcher):
     assert [h.matcher for h in _pre_tool_hooks(matcher)] == [matcher]
 
@@ -159,7 +162,7 @@ def _fire(store, hooks, tool_id):
             HOOK_EVENT_PRE_TOOL_USE,
             tool_name="touch /tmp/x",
             extra_hooks=hooks,
-            extra_hooks_tool_names=spec_hooks.spec_hook_tool_names(tool_id),
+            extra_hooks_tool_names=spec_hooks.spec_hook_tool_names(tool_id, hooks),
         )
     )
 
@@ -191,6 +194,38 @@ def test_a_matcher_is_never_compared_with_the_title(tmp_path, monkeypatch):
     ran = _recording_runner(monkeypatch)
     _fire(ScriptHookStore(tmp_path), _pre_tool_hooks("*touch*"), "run_command")
     assert ran == []
+
+
+def test_a_shell_alias_matcher_meets_a_kas_shell_call(tmp_path, monkeypatch):
+    ran = _recording_runner(monkeypatch)
+    hooks = _pre_tool_hooks("shell")
+    _fire(ScriptHookStore(tmp_path), hooks, "run_command")
+    assert ran == [hooks[0].id]
+
+
+def _audits(monkeypatch) -> list:
+    import kiro_crew.agent as agent_mod
+
+    audited: list = []
+    monkeypatch.setattr(agent_mod, "_sel_hook_rejected", lambda e, v, reason: audited.append(v))
+    return audited
+
+
+def test_an_unknown_kas_tool_id_is_audited_once_while_a_scoped_hook_is_loaded(monkeypatch):
+    hooks = _pre_tool_hooks("execute_bash")
+    audited = _audits(monkeypatch)
+    spec_hooks.spec_hook_tool_names("renamed_shell", hooks)
+    spec_hooks.spec_hook_tool_names("renamed_shell", hooks)
+    spec_hooks.spec_hook_tool_names("", hooks)
+    spec_hooks.spec_hook_tool_names("run_command", hooks)
+    assert audited == ["renamed_shell", ""]
+
+
+def test_an_unknown_kas_tool_id_is_not_audited_for_unscoped_hooks(monkeypatch):
+    hooks = _pre_tool_hooks("*")
+    audited = _audits(monkeypatch)
+    spec_hooks.spec_hook_tool_names("renamed_shell", hooks)
+    assert audited == []
 
 
 # ── Through the turn loop ──

@@ -113,62 +113,62 @@ WITHHELD_FROM_AUTO_APPROVE: frozenset[str] = frozenset(
 
 #: kiro-cli tool name -> the KAS tool ids that do the same job.
 #:
-#: A matcher in an agent spec's ``hooks`` names tools in kiro-cli's vocabulary
-#: (``execute_bash``, ``fs_write``). KAS names its own tools differently, and the
-#: name it states for a call is the ``toolId`` of the permission request's
-#: ``_meta.kiro`` (``AcpEvent.harness_tool_id``): a shell command is
-#: ``run_command``, a partial edit is ``str_replace``. Only the ids KAS's own
-#: tool classes declare appear here, and each row keeps to the KAS capability its
-#: kiro-cli name belongs to in KAS's tool table (``policy/capabilities.ts``), so a
-#: row never reaches a tool of a different kind. ``execute_bash`` covers the
-#: process-control tools as well, because starting a background process runs a
-#: command, and on kiro-cli ``execute_bash`` is the only tool that runs one.
+#: This is the one kiro-cli <-> KAS tool-name table. A matcher in an agent
+#: spec's ``hooks`` names tools in kiro-cli's vocabulary (``execute_bash``,
+#: ``fs_write``). KAS names its own tools differently, and the name it states for
+#: a call is the ``toolId`` of the permission request's ``_meta.kiro``
+#: (``AcpEvent.harness_tool_id``): a shell command is ``run_command``, a partial
+#: edit is ``str_replace``. Every id here is one a live KAS session (kiro-cli
+#: 2.24, ``--agent-engine v3``) stated on a permission request for that kind of
+#: call, and each row stays inside the KAS capability its kiro-cli name belongs
+#: to in KAS's tool table (``policy/capabilities.ts``), so a row never reaches a
+#: tool of a different kind.
 #:
-#: A kiro-cli tool with no KAS counterpart (``use_aws``) has no row, so a matcher
-#: that names only such tools matches nothing KAS runs.
+#: A kiro-cli tool with no row (``use_aws``) meets no KAS call. Read it through
+#: :func:`kas_tool_match_names` and :data:`KAS_TOOL_MATCH_VOCABULARY`; the rows
+#: themselves are for a caller that must go from a kiro-cli name to KAS ids.
 KAS_TOOL_IDS_BY_KIRO_TOOL: dict[str, tuple[str, ...]] = {
-    "execute_bash": (
-        "run_command",
-        "execute_bash",
-        "execute_pwsh",
-        "control_process",
-        "control_bash_process",
-        "control_pwsh_process",
-    ),
+    "execute_bash": ("run_command",),
     "fs_read": ("read_file", "list_directory"),
     "fs_write": ("fs_write", "fs_append", "str_replace", "delete_file"),
     "grep": ("grep_search",),
     "glob": ("file_search",),
     "web_fetch": ("web_fetch",),
-    "web_search": ("web_search", "remote_web_search"),
+    "web_search": ("remote_web_search",),
     "use_subagent": ("invoke_sub_agent",),
-    "code": ("code",),
-    "todo_list": ("todo_list",),
-    "knowledge": ("knowledge",),
 }
 
-#: Every name a tool matcher can mean on KAS: the kiro-cli names above and the
-#: KAS ids they reach.
-KAS_TOOL_MATCH_VOCABULARY: frozenset[str] = frozenset(KAS_TOOL_IDS_BY_KIRO_TOOL) | frozenset(
-    tool_id for ids in KAS_TOOL_IDS_BY_KIRO_TOOL.values() for tool_id in ids
+#: Other spellings of a kiro-cli tool that a spec may use, onto the name in
+#: :data:`KAS_TOOL_IDS_BY_KIRO_TOOL`: kiro-cli's legacy ``shell`` key, and the
+#: short ``read``/``write`` names KAS's own tool table classifies the same way.
+KIRO_TOOL_ALIASES: dict[str, str] = {
+    "shell": "execute_bash",
+    "read": "fs_read",
+    "write": "fs_write",
+}
+
+#: Every name a tool matcher can mean on KAS: the kiro-cli names and their
+#: aliases, and the KAS ids they reach.
+KAS_TOOL_MATCH_VOCABULARY: frozenset[str] = (
+    frozenset(KAS_TOOL_IDS_BY_KIRO_TOOL)
+    | frozenset(KIRO_TOOL_ALIASES)
+    | frozenset(tool_id for ids in KAS_TOOL_IDS_BY_KIRO_TOOL.values() for tool_id in ids)
 )
 
 
 def kas_tool_match_names(tool_id: str) -> tuple[str, ...]:
     """The names a tool matcher is compared with for a KAS call to ``tool_id``.
 
-    The KAS id itself, then every kiro-cli name whose row reaches it, so a matcher
-    written as either ``run_command`` or ``execute_bash`` meets a KAS shell call.
-    Empty for an empty id: a call KAS did not name matches no tool matcher.
+    The KAS id itself, then every kiro-cli name (and alias) whose row reaches it,
+    so a matcher written as ``run_command``, ``execute_bash`` or ``shell`` meets a
+    KAS shell call. Empty for an empty id: a call KAS did not name matches no
+    tool matcher.
     """
     if not tool_id:
         return ()
-    kiro_names = sorted(
-        name
-        for name, ids in KAS_TOOL_IDS_BY_KIRO_TOOL.items()
-        if tool_id in ids and name != tool_id
-    )
-    return (tool_id, *kiro_names)
+    kiro_names = {name for name, ids in KAS_TOOL_IDS_BY_KIRO_TOOL.items() if tool_id in ids}
+    kiro_names |= {alias for alias, name in KIRO_TOOL_ALIASES.items() if name in kiro_names}
+    return (tool_id, *sorted(kiro_names - {tool_id}))
 
 
 #: Glob syntax kiro-cli's ``allowedTools`` matcher documents for the TOOL part

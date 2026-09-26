@@ -256,7 +256,7 @@ def test_a_governance_denied_spec_hook_does_not_spawn(tmp_path, monkeypatch):
             tool_name="shell",
             parent_session_key="s1",
             extra_hooks=hooks,
-            extra_hooks_tool_names=spec_hooks.spec_hook_tool_names("run_command"),
+            extra_hooks_tool_names=spec_hooks.spec_hook_tool_names("run_command", hooks),
         )
     )
     assert [r.blocked for r in results] == [True]

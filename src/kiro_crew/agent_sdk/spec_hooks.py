@@ -25,10 +25,12 @@ Both spec shapes are read:
   action and a trigger with no Crew event are skipped too.
 
 A tool matcher is written in kiro-cli's tool names (``execute_bash``, ``fs_write``),
-and KAS names its tools differently. The turn loop therefore matches these hooks
-against :func:`spec_hook_tool_names` of the id KAS states for the call, not against
-the call's title, and a matcher that names no tool KAS runs is dropped here, warned
-about and audited, rather than kept as a hook that can never fire.
+and KAS names its tools differently. On a PreToolUse permission request the turn
+loop therefore matches these hooks against :func:`spec_hook_tool_names` of the id
+KAS states for the call, not against the call's title. A PostToolUse still sees the
+title, because KAS's tool-call frames carry no tool id. A matcher that names no tool
+KAS runs is dropped here, warned about and audited, rather than kept as a hook that
+can never fire.
 
 The result is cached by the field's content, so a spec that stays the same costs
 one conversion and logs its warnings once, not once per turn.
@@ -40,6 +42,7 @@ import hashlib
 import json
 import logging
 import math
+from collections.abc import Sequence
 from typing import Any
 
 from kiro_crew.hooks import (
@@ -107,19 +110,48 @@ def _matcher_names_a_kas_tool(matcher: str) -> bool:
     return matcher == "*" or any(_tool_matches(matcher, name) for name in KAS_TOOL_MATCH_VOCABULARY)
 
 
-def spec_hook_tool_names(tool_id: str) -> tuple[str, ...]:
-    """The names a spec hook's tool matcher meets for a KAS call to ``tool_id``.
+#: Tool ids already reported as unknown, so a session warns once per id, not per call.
+_unknown_tool_ids: set[str] = set()
+
+#: Bound on :data:`_unknown_tool_ids`; cleared rather than grown past it.
+_UNKNOWN_TOOL_IDS_MAX = 64
+
+
+def spec_hook_tool_names(tool_id: str, hooks: Sequence[ScriptHook]) -> tuple[str, ...]:
+    """The names ``hooks``' tool matchers meet for a KAS call to ``tool_id``.
 
     KAS's id and the kiro-cli names that mean the same tool, from the one table in
     :data:`kiro_crew.acp.kas_permissions.KAS_TOOL_IDS_BY_KIRO_TOOL`. KAS is the only
     backend in ``ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS``, so its vocabulary is the one
-    read; a second member brings its own table with it. Empty for an empty id, so a
-    call KAS did not name meets only an unscoped spec hook.
+    read; a second member brings its own table with it.
+
+    An id that is empty or not in the table has no kiro-cli name, so a matcher
+    written in kiro-cli's names (``execute_bash``) does not meet it; only a matcher
+    that names or globs the raw id itself can. That is the silent miss this
+    translation exists to prevent, so when ``hooks`` holds a scoped tool matcher,
+    such an id is warned about and SEL-audited, once per id: a KAS release that
+    stops stating an id, or renames one, is then visible.
     """
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
-    from kiro_crew.acp.kas_permissions import kas_tool_match_names
+    from kiro_crew.acp.kas_permissions import KAS_TOOL_MATCH_VOCABULARY, kas_tool_match_names
 
+    if tool_id not in KAS_TOOL_MATCH_VOCABULARY and tool_id not in _unknown_tool_ids:
+        scoped = any(h.event in _TOOL_EVENTS and h.matcher not in ("", "*") for h in hooks)
+        if scoped:
+            if len(_unknown_tool_ids) >= _UNKNOWN_TOOL_IDS_MAX:
+                _unknown_tool_ids.clear()
+            _unknown_tool_ids.add(tool_id)
+            # circular import: agent imports hooks, which this module imports at load time.
+            from kiro_crew.agent import _sel_hook_rejected
+
+            reason = (
+                f"KAS named the tool {tool_id or '(nothing)'!r}, which has no kiro-cli "
+                "name, so a spec hook matcher written in kiro-cli's tool names does not "
+                "run for its calls"
+            )
+            logger.warning("spec hooks: %s", reason)
+            _sel_hook_rejected(HOOK_EVENT_PRE_TOOL_USE, tool_id, reason)
     return kas_tool_match_names(tool_id)
 
 
