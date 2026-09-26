@@ -24,6 +24,12 @@ Both spec shapes are read:
   so is ``confirm: true``, because no prompt can be shown from here; an ``agent``
   action and a trigger with no Crew event are skipped too.
 
+A tool matcher is written in kiro-cli's tool names (``execute_bash``, ``fs_write``),
+and KAS names its tools differently. The turn loop therefore matches these hooks
+against :func:`spec_hook_tool_names` of the id KAS states for the call, not against
+the call's title, and a matcher that names no tool KAS runs is dropped here, warned
+about and audited, rather than kept as a hook that can never fire.
+
 The result is cached by the field's content, so a spec that stays the same costs
 one conversion and logs its warnings once, not once per turn.
 """
@@ -91,6 +97,32 @@ def _matcher_ok(matcher: object) -> bool:
     return _hook_matcher_ok(matcher)
 
 
+def _matcher_names_a_kas_tool(matcher: str) -> bool:
+    """Whether ``matcher`` can match any tool name KAS runs (see :func:`spec_hook_tool_names`)."""
+    # circular import: the ACP layer imports the config loader, which sits below
+    # this module; resolved at call time like the other driver seams here.
+    from kiro_crew.acp.kas_permissions import KAS_TOOL_MATCH_VOCABULARY
+    from kiro_crew.hooks import _tool_matches
+
+    return matcher == "*" or any(_tool_matches(matcher, name) for name in KAS_TOOL_MATCH_VOCABULARY)
+
+
+def spec_hook_tool_names(tool_id: str) -> tuple[str, ...]:
+    """The names a spec hook's tool matcher meets for a KAS call to ``tool_id``.
+
+    KAS's id and the kiro-cli names that mean the same tool, from the one table in
+    :data:`kiro_crew.acp.kas_permissions.KAS_TOOL_IDS_BY_KIRO_TOOL`. KAS is the only
+    backend in ``ACP_BACKENDS_CREW_FIRES_SPEC_HOOKS``, so its vocabulary is the one
+    read; a second member brings its own table with it. Empty for an empty id, so a
+    call KAS did not name meets only an unscoped spec hook.
+    """
+    # circular import: the ACP layer imports the config loader, which sits below
+    # this module; resolved at call time like the other driver seams here.
+    from kiro_crew.acp.kas_permissions import kas_tool_match_names
+
+    return kas_tool_match_names(tool_id)
+
+
 def _reject(agent_id: str, event: object, value: object, reason: str) -> None:
     """Warn about, and SEL-audit, a spec hook that will not run.
 
@@ -121,6 +153,11 @@ def _hook(agent_id: str, event: str, index: int, entry: dict, timeout: int) -> S
         # Dropped whole, as the materialized spec's merge drops it: running the
         # hook with no matcher would widen it to every tool.
         _reject(agent_id, event, command, "invalid matcher")
+        return None
+    if isinstance(matcher, str) and matcher and not _matcher_names_a_kas_tool(matcher):
+        # A matcher only kiro-cli's own tools answer (``use_aws``) meets no KAS
+        # call, so the hook is dropped out loud instead of kept silently inert.
+        _reject(agent_id, event, command, f"matcher {matcher!r} names no tool this backend runs")
         return None
     return ScriptHook(
         id=f"spec:{agent_id}:{event}:{index}",
