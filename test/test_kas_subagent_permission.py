@@ -16,9 +16,9 @@ from typing import Any
 import pytest
 
 from kiro_crew import cli_chat
-from kiro_crew.acp._dispatch import build_permission_event, kas_consent_classification
+from kiro_crew.acp._dispatch import build_permission_event, kas_consent_tool
 from kiro_crew.acp.types import ACP_BACKEND_KAS, ACP_BACKEND_KIRO, AcpPromptStats, JsonRpcMessage
-from kiro_crew.hooks import TOOL_DENY, HookManager
+from kiro_crew.hooks import TOOL_DENY, HookManager, HooksConfig
 
 TOOL_CALL_ID = "invoke_subagent_toolu_01"
 
@@ -77,15 +77,32 @@ class TestTheSubagentRequestIsClassified:
         )
         assert "could not be verified" not in (result.reason or "")
 
-    def test_it_earns_no_argument_provenance(self):
-        """Classification is all it gets: nothing about params or identity."""
+    def test_it_carries_the_crew_tool_name_and_no_provenance(self):
+        """The name deny and governance rules are written against, and nothing
+        else: no trusted params, no cache-hit identity flag."""
         event = _event(_subagent_params())
+        assert event.tool_name == "use_subagent"
         assert event.raw_params_trusted is False
         assert event.mcp_identity_trusted is False
-        assert event.tool_name == ""
+        assert event.mcp_server_name == ""
 
-    def test_orchestrate_subagent_is_the_same_tool_family(self):
-        assert kas_consent_classification(_subagent_params(toolId="orchestrate_subagent"))
+    def test_a_deny_rule_on_the_crew_name_binds(self):
+        """Without the name, a ``use_subagent`` deny would meet only the title
+        ``Sub-agent: my-research`` and the spawn could be approved."""
+        event = _event(_subagent_params())
+        result = HookManager(HooksConfig(auto_deny_tools=["use_subagent"])).on_tool_call(
+            event.title,
+            command=event.shell_command,
+            is_shell=event.is_shell,
+            mcp_tool_name=event.tool_name,
+            mcp_server_name=event.mcp_server_name,
+            mcp_identity_trusted=event.mcp_identity_trusted,
+        )
+        assert result.action == TOOL_DENY
+
+    def test_only_the_verified_tool_id_is_known(self):
+        assert kas_consent_tool(_subagent_params()) == "use_subagent"
+        assert kas_consent_tool(_subagent_params(toolId="orchestrate_subagent")) == ""
 
 
 class TestEveryOtherShapeStaysUnclassified:
@@ -115,6 +132,7 @@ class TestEveryOtherShapeStaysUnclassified:
     def test_a_disagreeing_field_keeps_the_refusal(self, overrides):
         event = _event(_subagent_params(**overrides))
         assert event.shell_classified is False
+        assert event.tool_name == ""
         assert cli_chat._unverifiable_shell(event) is True
 
     @pytest.mark.parametrize("meta", [None, "kiro", {"kiro": "x"}, {}], ids=repr)
