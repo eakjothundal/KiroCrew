@@ -885,9 +885,15 @@ async def _answer_permission(
         await provider.reject_tool(event.request_id)
         try:
             safe_title = _for_consent(title, stream=sys.stderr)
+            # Name what actually failed. A request whose kind reads as a command
+            # claimed one; a request with no classification at all claimed
+            # nothing, and saying it did sends the reader after the wrong defect.
+            if is_shell_kind(_kind_text(event)):
+                what = "claims to run a command, but its command could not be verified"
+            else:
+                what = "could not be identified as a known tool call, so it cannot be verified"
             _print_permission_notice(
-                f"\nDenied automatically: {safe_title} claims to run a command, "
-                "but its command could not be verified.\n"
+                f"\nDenied automatically: {safe_title} {what}.\n"
                 "   Ask the agent to retry the tool call."
             )
         except Exception:

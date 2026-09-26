@@ -83,10 +83,27 @@ class TestBuiltinToolsBecomeCapabilities:
 
     def test_rules_are_ordered_deterministically(self):
         """Two rebuilds of the same list must produce byte-identical output."""
-        entries = ["web_search", "invoke_sub_agent", "web_fetch"]
+        entries = ["web_search", "use_subagent", "web_fetch"]
         first = allowed_tools_to_permissions(entries)
         second = allowed_tools_to_permissions(list(reversed(entries)))
         assert first == second
+
+
+class TestTheSubagentToolIsKeyedOnTheCrewName:
+    """``allowedTools`` carries Crew's tool names, so the sub-agent grant must be
+    keyed on ``use_subagent`` -- the name every real spec lists."""
+
+    def test_use_subagent_produces_the_subagent_capability(self):
+        policy = allowed_tools_to_permissions(["use_subagent"])
+        assert policy == {"rules": [{"capability": "subagent", "effect": "allow"}]}
+
+    def test_the_kas_internal_tool_id_is_not_an_alias(self):
+        """``invoke_sub_agent`` is KAS's own toolId. As a second key it would be a
+        spelling the ceiling is never asked about under the Crew name."""
+        assert allowed_tools_to_permissions(["invoke_sub_agent"]) is None
+
+    def test_the_ceiling_is_asked_about_the_crew_name(self):
+        assert CEILING_REFS_BY_CAPABILITY["subagent"] == ("use_subagent",)
 
 
 class TestTheShellAndFilesystemFamiliesAreRefused:

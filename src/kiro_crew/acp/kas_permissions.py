@@ -65,12 +65,21 @@ _MCP_CAPABILITY = "mcp"
 #: KAS's table: an entry here is a promise that auto-approving the Crew tool and
 #: allowing the KAS capability mean the same thing. Anything absent is treated as
 #: unclassifiable and left to prompt (see the module docstring).
+#:
+#: Keyed on the names an ``allowedTools`` list carries, which are Crew's (and
+#: kiro-cli's) names, not KAS's internal toolIds. The sub-agent tool is
+#: ``use_subagent`` there; KAS calls the same tool ``invoke_sub_agent``, and that
+#: spelling is deliberately NOT a key. The governance ceiling filters
+#: ``allowedTools`` by ref before this table reads it, so a second spelling for
+#: one tool would let a spec obtain under the alias the grant the ceiling withholds
+#: under the Crew name. ``disclose_context`` stays: it is KAS's skill tool, Crew
+#: has no name of its own for it, so there is no Crew spelling it could alias.
 CAPABILITY_BY_TOOL: dict[str, str] = {
     # Network.
     "web_fetch": "web_fetch",
     "web_search": "web_search",
     # Sub-agents and skills.
-    "invoke_sub_agent": "subagent",
+    "use_subagent": "subagent",
     "disclose_context": "skill",
 }
 
