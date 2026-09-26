@@ -975,34 +975,63 @@ class TestJudgeTickReportsWhetherItAsked:
             captured_receipt.update(receipt)
             return answers
 
+        started = threading.Event()
+        release = threading.Event()
+
         def _late_normalizing_append(row, *, commit_event=None):
-            time.sleep(0.07)
+            started.set()
+            release.wait(5.0)
             return original_append(dict(row), commit_event=commit_event)
 
         monkeypatch.setattr(decisions_gate, "_snapshot", lambda: _Config())
         monkeypatch.setattr(decisions_gate, "_consented_for", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(decisions_gate, "_capability_denied", lambda *_args, **_kwargs: False)
         monkeypatch.setattr(decisions_gate, "_oracle", lambda *_args, **_kwargs: _InvalidOracle())
-        monkeypatch.setattr(decisions_gate, "_LOG_BUDGET_SECS", 0.05)
+        monkeypatch.setattr(decisions_gate, "_LOG_BUDGET_SECS", 0.005)
         monkeypatch.setattr(decisions_log, "append", _late_normalizing_append)
         monkeypatch.setattr(decisions_log, "sweep_expired", lambda: 0)
         monkeypatch.setattr(point.core, "decide", _decide)
 
         trace: dict = {}
-        verdict = asyncio.run(
-            point.judge_tick(
-                "watch it",
-                evidence=[
-                    {
-                        "source": "session:chat-1",
-                        "kind": point.KIND_TRANSCRIPT_TAIL,
-                        "age_s": 1.0,
-                        "text": "new evidence",
-                    }
-                ],
-                trace=trace,
+
+        async def drive():
+            # The pickup has to happen on a WARM executor, because the grace this case
+            # relies on is the production one and it starts the instant the budget
+            # expires -- in parallel with the pickup, not after it. A cold
+            # ``asyncio.to_thread`` pays thread CREATION inside that window, which is
+            # the part a loaded runner stretches without bound; a pool that already
+            # holds an idle thread turns the pickup into a handoff. Nothing here
+            # widens a production timeout: the grace the append must land inside stays
+            # exactly the 0.10 s the gate ships.
+            await asyncio.to_thread(lambda: None)
+            task = asyncio.create_task(
+                point.judge_tick(
+                    "watch it",
+                    evidence=[
+                        {
+                            "source": "session:chat-1",
+                            "kind": point.KIND_TRANSCRIPT_TAIL,
+                            "age_s": 1.0,
+                            "text": "new evidence",
+                        }
+                    ],
+                    trace=trace,
+                )
             )
-        )
+            # Wait for the worker rather than sleeping a guessed interval past the
+            # budget: a sleep chosen to outlast it is what made this case depend on
+            # the runner. Once the worker is parked on ``release`` the budget can only
+            # expire, so "the append lands after the budget" is a fact, and the short
+            # wait below is only to let that expiry happen before the release.
+            deadline = time.monotonic() + 5.0
+            while not started.is_set():
+                assert time.monotonic() < deadline, "append worker never started"
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(decisions_gate._LOG_BUDGET_SECS * 4)
+            release.set()
+            return await task
+
+        verdict = asyncio.run(drive())
         row = judge.verdict_entry(
             verdict,
             trace["evidence_items"],
