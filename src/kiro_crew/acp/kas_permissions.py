@@ -48,7 +48,7 @@ it passes the same ceiling the derived rules do, or it does not travel.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,9 @@ _MCP_PREFIX = "@"
 
 #: KAS's capability for any MCP-served tool.
 _MCP_CAPABILITY = "mcp"
+
+#: How an MCP tool's title spells it at the gate: ``mcp__<server>__<tool>``.
+_MCP_TITLE_PREFIX = "mcp__"
 
 #: Tool name -> KAS capability, mirroring KAS's own tool classification for the
 #: built-in tools Crew's specs actually name. Deliberately NOT exhaustive over
@@ -783,3 +786,89 @@ def merge_user_permissions(
     )
     base = list(derived["rules"]) if derived else []
     return {"rules": kept + base}
+
+
+#: Every capability an ``allow`` can reach KAS for from this module: the ones
+#: :data:`CAPABILITY_BY_TOOL` carries, and MCP. The shell and filesystem families
+#: never travel as an allow (:data:`WITHHELD_CAPABILITIES`), so they already raise
+#: a permission request and need nothing here.
+AUTO_APPROVABLE_CAPABILITIES: tuple[str, ...] = tuple(
+    sorted(set(CAPABILITY_BY_TOOL.values()) | {_MCP_CAPABILITY})
+)
+
+
+def hook_gated_capabilities(matchers: Iterable[str]) -> set[str]:
+    """The auto-approvable capabilities a PreToolUse hook matcher could cover.
+
+    Read with the hook store's own tool matcher, so a matcher covers here exactly
+    what it covers at the gate. The reading errs toward covering, because the cost
+    of a wrong answer is lopsided: covering too much turns an auto-approval into a
+    permission request, covering too little lets a call past a hook the author
+    wrote to gate it.
+
+    * An empty matcher, or ``*``, covers every tool.
+    * A literal Crew tool name covers its own capability, or nothing when that
+      tool is never auto-approved here (``execute_bash``, ``fs_write``).
+    * A literal MCP tool name (``@server/tool``, ``mcp__server__tool``) covers MCP.
+    * Any other literal covers everything: it names no tool this table knows, so
+      it may be a harness's own name for a built-in one.
+    * A glob covers each built-in capability it matches by tool or capability
+      name, and MCP, whose tool names at the gate this table does not spell.
+    """
+    # Deferred: this module imports nothing of Crew's, and the hook store's is heavy.
+    from kiro_crew.hooks import _tool_matches
+
+    covered: set[str] = set()
+    for raw in matchers:
+        matcher = raw.strip() if isinstance(raw, str) else ""
+        if not matcher or matcher == "*":
+            return set(AUTO_APPROVABLE_CAPABILITIES)
+        if not _GLOB_METACHARACTERS.intersection(matcher):
+            name = matcher.lower()
+            if name in CAPABILITY_BY_TOOL:
+                covered.add(CAPABILITY_BY_TOOL[name])
+            elif name.startswith((_MCP_PREFIX, _MCP_TITLE_PREFIX)):
+                covered.add(_MCP_CAPABILITY)
+            elif name not in WITHHELD_FROM_AUTO_APPROVE:
+                return set(AUTO_APPROVABLE_CAPABILITIES)
+            continue
+        covered.update(
+            capability
+            for tool, capability in CAPABILITY_BY_TOOL.items()
+            if _tool_matches(matcher, tool) or _tool_matches(matcher, capability)
+        )
+        covered.add(_MCP_CAPABILITY)
+    return covered
+
+
+def withhold_hook_gated_auto_approval(
+    policy: dict[str, Any] | None,
+    pre_tool_matchers: Iterable[str],
+    *,
+    agent_id: str = "",
+) -> dict[str, Any] | None:
+    """*policy* with an ``ask`` for every capability a PreToolUse hook covers.
+
+    A PreToolUse hook runs on Crew's permission path, and an auto-approved call
+    never takes that path, so the hook would not see it. KAS resolves the most
+    restrictive matching rule (``deny`` over ``ask`` over ``allow``, not first
+    match), so one unscoped ``ask`` outranks every ``allow`` on that capability:
+    the derived ones and any the author's own block relayed. The call then comes
+    back as a permission request, where the hook runs and Crew's own approval
+    decides as it does for any other request. A ``deny`` still outranks it.
+
+    ``None`` stays ``None``: with no policy every request already asks.
+    """
+    if not policy:
+        return policy
+    covered = hook_gated_capabilities(pre_tool_matchers)
+    if not covered:
+        return policy
+    logger.info(
+        "agent %r: not auto-approving %s on this backend -- a PreToolUse hook covers "
+        "it, and an auto-approved call raises no permission request for it to run on",
+        agent_id,
+        ", ".join(sorted(covered)),
+    )
+    asks = [{"capability": capability, "effect": "ask"} for capability in sorted(covered)]
+    return {"rules": [*policy["rules"], *asks]}

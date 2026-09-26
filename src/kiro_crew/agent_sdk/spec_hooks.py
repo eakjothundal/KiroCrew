@@ -26,16 +26,23 @@ Both spec shapes are read:
 
 The result is cached by the field's content, so a spec that stays the same costs
 one conversion and logs its warnings once, not once per turn.
+
+The turn loop is not the only place a tool runs: a subagent run and a task-runner
+step fire the same hook store for their own tool calls. :func:`turn_spec_hooks`
+answers for those, keyed on the SUBAGENT's agent and its own provider, so a kiro-cli
+subagent under a KAS parent still gets nothing from Crew.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import math
 from typing import Any
 
+from kiro_crew.agent_sdk.capabilities import capabilities_of
 from kiro_crew.hooks import (
     HOOK_EVENT_AGENT_SPAWN,
     HOOK_EVENT_POST_TOOL_USE,
@@ -72,7 +79,9 @@ _MAX_COMMAND_LEN = 4096
 #: cleared rather than grown once it reaches this.
 _CACHE_MAX = 64
 
-_cache: dict[tuple[str, str], tuple[ScriptHook, ...]] = {}
+#: Per spec content: the hooks that run, and how many ``confirm: true`` documents
+#: were skipped (the session-start notice names the count).
+_cache: dict[tuple[str, str], tuple[tuple[ScriptHook, ...], int]] = {}
 
 
 def _diagnostic(value: object) -> str:
@@ -159,7 +168,7 @@ def _from_object_form(agent_id: str, hooks: dict) -> list[ScriptHook]:
     return out
 
 
-def _from_documents(agent_id: str, hooks: list) -> list[ScriptHook]:
+def _from_documents(agent_id: str, hooks: list, unconfirmable: list[int]) -> list[ScriptHook]:
     # circular import: agent imports hooks, which this module imports at load time.
     from kiro_crew.agent import _event_for_hook_trigger, normalize_spec_hooks
 
@@ -175,6 +184,7 @@ def _from_documents(agent_id: str, hooks: list) -> list[ScriptHook]:
             _reject(agent_id, trigger, command, "hook is disabled")
             continue
         if doc.get("confirm") is True:
+            unconfirmable.append(index)
             _reject(
                 agent_id,
                 trigger,
@@ -205,20 +215,25 @@ def spec_script_hooks(agent_id: str, spec: dict[str, Any]) -> list[ScriptHook]:
     Empty when the spec carries none. Either shape is read (see the module
     docstring); anything else is warned about, audited once, and yields nothing.
     """
+    return list(_convert(agent_id, spec)[0])
+
+
+def _convert(agent_id: str, spec: dict[str, Any]) -> tuple[tuple[ScriptHook, ...], int]:
     value = spec.get("hooks")
     if not value:
-        return []
+        return (), 0
     try:
         digest = hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
     except (TypeError, ValueError):
         digest = ""
     key = (agent_id, digest)
     if digest and key in _cache:
-        return list(_cache[key])
+        return _cache[key]
+    unconfirmable: list[int] = []
     if isinstance(value, dict):
         hooks = _from_object_form(agent_id, value)
     elif isinstance(value, list):
-        hooks = _from_documents(agent_id, value)
+        hooks = _from_documents(agent_id, value, unconfirmable)
     else:
         _reject(agent_id, "hooks", value, "hooks is neither an object nor an array")
         hooks = []
@@ -230,20 +245,23 @@ def spec_script_hooks(agent_id: str, spec: dict[str, Any]) -> list[ScriptHook]:
             f"more than {_MAX_SPEC_HOOKS} spec hooks, ignoring the remainder",
         )
         hooks = hooks[:_MAX_SPEC_HOOKS]
+    result = (tuple(hooks), len(unconfirmable))
     if digest:
         if len(_cache) >= _CACHE_MAX:
             _cache.clear()
-        _cache[key] = tuple(hooks)
-    return list(hooks)
+        _cache[key] = result
+    return result
 
 
-def crew_fired_spec_hooks(agent_id: str) -> tuple[list[ScriptHook], list[str]]:
-    """The active agent spec's hooks as script hooks, and the keys nothing carries.
+def crew_fired_spec_hooks(agent_id: str) -> tuple[list[ScriptHook], list[str], int]:
+    """The active agent spec's hooks as script hooks, the keys nothing carries, and
+    how many ``confirm: true`` hooks are skipped.
 
     Reads the spec the KAS projection reads, through the same reader
-    (:func:`kiro_crew.acp.kas_agents.load_agent_spec`). The second value names the
-    spec keys a KAS session runs without, for the session-start notice. Raises when
-    the spec cannot be read; the caller fails PreToolUse closed on that.
+    (:func:`kiro_crew.acp.kas_agents.load_agent_spec`). The second and third values
+    are for the session-start notice: the spec keys a KAS session runs without, and
+    the hooks that wait for a confirmation Crew cannot ask for. Raises when the spec
+    cannot be read; the caller fails PreToolUse closed on that.
     """
     # circular import: the ACP layer imports the config loader, which sits below
     # this module; resolved at call time like the other driver seams here.
@@ -251,4 +269,35 @@ def crew_fired_spec_hooks(agent_id: str) -> tuple[list[ScriptHook], list[str]]:
     from kiro_crew.config.paths import kiro_agents_dir
 
     spec = load_agent_spec(kiro_agents_dir(), agent_id)
-    return spec_script_hooks(agent_id, spec), spec_keys_without_carrier(spec)
+    hooks, unconfirmable = _convert(agent_id, spec)
+    return list(hooks), spec_keys_without_carrier(spec), unconfirmable
+
+
+async def turn_spec_hooks(
+    provider: object, agent_id: str
+) -> tuple[list[ScriptHook], str | None, bool]:
+    """The spec hooks a subagent or task-runner turn fires, where they run, and
+    whether the spec could not be read.
+
+    *provider* and *agent_id* are the turn's OWN: a subagent runs its own agent on
+    its own backend, so a kiro-cli subagent under a KAS parent gets
+    ``([], None, False)`` here, as its harness already runs the field. The second
+    value is the session's workspace, the ``extra_hooks_cwd`` the hooks run in
+    (``None`` for the gateway's own). When the third is true the caller blocks
+    every permission request, as the chat turn loop does: a deny hook that was
+    never loaded gave no verdict.
+    """
+    if not agent_id or not capabilities_of(provider).crew_fires_spec_hooks:
+        return [], None, False
+    cwd = getattr(provider, "cwd", "")
+    work_dir = cwd if isinstance(cwd, str) and cwd else None
+    try:
+        hooks, _lost, _unconfirmable = await asyncio.to_thread(crew_fired_spec_hooks, agent_id)
+    except Exception:  # noqa: BLE001 - the caller fails permission requests closed
+        logger.warning(
+            "agent spec hooks for %r could not be read; tool calls are blocked",
+            agent_id,
+            exc_info=True,
+        )
+        return [], work_dir, True
+    return hooks, work_dir, False

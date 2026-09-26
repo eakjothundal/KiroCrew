@@ -789,14 +789,15 @@ async def _prepare_spec_hooks(
     every other session gets ``([], False, None)`` without the spec being read.
 
     On a new session, a spec that sets a key nothing carries to this backend gets
-    one notice row, so the agent does not run without it silently.
+    one notice row, and so does a spec with ``confirm: true`` hooks, which Crew
+    skips because it cannot ask for the confirmation. Neither runs silently.
     """
     if not agent or not capabilities_of(client).crew_fires_spec_hooks:
         return [], False, None
     cwd = getattr(client, "cwd", "")
     work_dir = cwd if isinstance(cwd, str) and cwd else None
     try:
-        hooks, lost = await asyncio.to_thread(crew_fired_spec_hooks, agent)
+        hooks, lost, unconfirmable = await asyncio.to_thread(crew_fired_spec_hooks, agent)
     except Exception:  # noqa: BLE001 - the caller fails PreToolUse closed
         logger.warning(
             "agent spec hooks for %r could not be read; tool calls are blocked",
@@ -812,6 +813,14 @@ async def _prepare_spec_hooks(
             _redact_display_text(_spec_keys_notice(agent, lost)),
             "msg msg-info",
         )
+    if is_new and unconfirmable:
+        append_and_surface(
+            state,
+            slot,
+            "notice",
+            _redact_display_text(_spec_confirm_hooks_notice(agent, unconfirmable)),
+            "msg msg-info",
+        )
     return hooks, False, work_dir
 
 
@@ -820,6 +829,15 @@ def _spec_keys_notice(agent: str, keys: list[str]) -> str:
     return (
         f"ℹ️ Agent {agent} sets {' and '.join(keys)}, which this backend does not "
         "receive, so they have no effect in this session."
+    )
+
+
+def _spec_confirm_hooks_notice(agent: str, count: int) -> str:
+    """The session-start notice for ``confirm: true`` spec hooks this backend skips."""
+    hooks = "hook asks" if count == 1 else "hooks ask"
+    return (
+        f"ℹ️ Agent {agent} has {count} {hooks} to be confirmed before running. "
+        "This backend cannot ask, so they do not run in this session."
     )
 
 

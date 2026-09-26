@@ -81,8 +81,10 @@ if TYPE_CHECKING:
         provider_fallback_active,
         run_in_embed_pool,
         sel,
+        spec_pre_tool_block,
         time,
         transient_retry_delay,
+        turn_spec_hooks,
         update_state,
         window_for_provider_client,
         write_result_chunk,
@@ -1578,6 +1580,12 @@ class RunEventCoordinator(ManagerComponent):
         # when EVENT_TOOL_RESULT arrives (which only carries tool_call_id and output).
         # Mirrors kiro_crew.dashboard.chat_runner._pending_tools.
         _pending_tools: dict[str, str] = {}
+        # The subagent's OWN spec hooks, when its OWN backend never receives them:
+        # keyed on this run's agent and provider, never the parent's, so a
+        # kiro-cli subagent (whose harness runs the field) gets none from Crew.
+        # PreToolUse ones gate each permission request below; the KAS projection
+        # turns every call they cover into one.
+        _spec_hooks, _spec_hooks_cwd, _spec_hooks_unreadable = await turn_spec_hooks(client, agent)
 
         async def _stream_with_transient_retry():
             """Yield stream events, retrying transient backend errors.
@@ -1986,6 +1994,31 @@ class RunEventCoordinator(ManagerComponent):
                     logger.warning("Subagent %s hit turn limit (%d)", info.id, turn_limit)
                     self._manager._write_tombstone(info, "turn_limit")
                     return
+                _spec_block = (
+                    "the agent spec's hooks could not be read"
+                    if _spec_hooks_unreadable
+                    else await spec_pre_tool_block(
+                        self._manager.hook_store,
+                        _spec_hooks,
+                        _spec_hooks_cwd,
+                        event.title,
+                        event.tool_input,
+                        subagent_id=info.id,
+                        parent_session_key=info.parent_session_key or None,
+                        agent_role=info.agent or None,
+                    )
+                )
+                if _spec_block is not None:
+                    logger.warning("Subagent %s spec hook blocked a tool: %s", info.id, _spec_block)
+                    await self._manager._reject_and_log(
+                        client,
+                        event.request_id,
+                        session_key,
+                        event,
+                        error="hook_deny",
+                        metadata={"subagent_id": info.id, "reason": "spec_hook"},
+                    )
+                    continue
                 tool_result = self._manager._ctx_builder.hooks.on_tool_call(
                     event.title,
                     session_key=session_key,
@@ -2290,6 +2323,8 @@ class RunEventCoordinator(ManagerComponent):
                             subagent_id=info.id,
                             parent_session_key=info.parent_session_key or None,
                             agent_role=info.agent or None,
+                            extra_hooks=_spec_hooks,
+                            extra_hooks_cwd=_spec_hooks_cwd,
                         )
                     except Exception:
                         logger.debug(

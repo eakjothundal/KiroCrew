@@ -22,6 +22,7 @@ from kiro_crew.agent_sdk.drivers.acp_vocab import (
     STOP_RECOVERY_MAX_RETRIES,
     classify_stop_reason,
 )
+from kiro_crew.agent_sdk.spec_hooks import turn_spec_hooks
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
 from kiro_crew.hooks import (
@@ -30,6 +31,7 @@ from kiro_crew.hooks import (
     fire_tool_hooks,
     get_global_hook_store,
     hook_gate_kwargs,
+    spec_pre_tool_block,
 )
 from kiro_crew.llm_helpers import provider_last_turn_usage, stream_and_collect_json
 from kiro_crew.messaging.dispatch import consume_reinjection, rearm_reinjection
@@ -501,6 +503,14 @@ async def execute_task(
             else:
                 full_prompt = task_prompt
 
+            # The step's agent spec hooks, when its backend never receives them
+            # (none on kiro-cli, whose harness runs the field itself). They gate
+            # each permission request; the KAS projection turns every call they
+            # cover into one.
+            _spec_hooks, _spec_hooks_cwd, _spec_hooks_unreadable = await turn_spec_hooks(
+                client, agent
+            )
+
             result_text = ""
             _chunk_count = 0
             _complete_event: LLMEvent | None = None
@@ -521,6 +531,30 @@ async def execute_task(
                     run.last_task_time = _time.time()
                     run.tokens_used += max(1, len(event.text) // 4)
                 elif event.kind == EVENT_PERMISSION_REQUEST:
+                    _spec_block = (
+                        "the agent spec's hooks could not be read"
+                        if _spec_hooks_unreadable
+                        else await spec_pre_tool_block(
+                            get_global_hook_store(),
+                            _spec_hooks,
+                            _spec_hooks_cwd,
+                            event.title,
+                            event.tool_input,
+                            parent_session_key=session_key or None,
+                            agent_role=(agent or "kirocrew"),
+                        )
+                    )
+                    if _spec_block is not None:
+                        logger.warning("task step spec hook blocked a tool: %s", _spec_block)
+                        await _reject_and_log(
+                            client,
+                            sel(),
+                            session_key,
+                            agent,
+                            event,
+                            metadata={"reason": "spec_hook_deny"},
+                        )
+                        continue
                     # Honor the user-configured auto-approve trust (hook
                     # TOOL_AUTO_APPROVE from hooks.auto_approve_tools) before the
                     # interactive prompt, so explicit trust is respected instead

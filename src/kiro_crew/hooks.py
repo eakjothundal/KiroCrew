@@ -5272,6 +5272,7 @@ class ScriptHookStore:
         hook_continuation_count: int = 0,
         extra_hooks: Sequence[ScriptHook] = (),
         extra_hooks_cwd: str | None = None,
+        stored_hooks: bool = True,
     ) -> list[ScriptHookResult]:
         """Fire all enabled hooks matching the given event. Returns results.
 
@@ -5281,6 +5282,7 @@ class ScriptHookStore:
         :mod:`kiro_crew.agent_sdk.spec_hooks`), not to this store. They run in
         ``extra_hooks_cwd`` -- the session's workspace, where the harness that
         would otherwise run them runs them -- and their payload's ``cwd`` says so.
+        ``stored_hooks=False`` fires the extra hooks alone.
 
         For PreToolUse/PostToolUse, matcher filters by tool name.
         For AgentSpawn/UserPromptSubmit/Stop, all hooks for that event fire.
@@ -5331,7 +5333,8 @@ class ScriptHookStore:
             hook_event["agent_role"] = agent_role
 
         extra_ids = {id(h) for h in extra_hooks}
-        for hook in [*self._hooks.values(), *extra_hooks]:
+        stored = list(self._hooks.values()) if stored_hooks else []
+        for hook in [*stored, *extra_hooks]:
             if not hook.enabled or hook.event != event:
                 continue
             # Matcher filtering: for tool hooks, match tool name; for others, match context
@@ -5525,3 +5528,64 @@ async def fire_tool_hooks(
         )
     except Exception:
         logger.debug("PreToolUse hook error", exc_info=True)
+
+
+async def spec_pre_tool_block(
+    hook_store: ScriptHookStore | None,
+    spec_hooks: Sequence[ScriptHook],
+    spec_hooks_cwd: str | None,
+    event_title: str,
+    event_tool_input: str | None = None,
+    *,
+    subagent_id: str | None = None,
+    parent_session_key: str | None = None,
+    agent_role: str | None = None,
+) -> str | None:
+    """Run an agent spec's own PreToolUse hooks on a permission request.
+
+    For a subagent or task-runner turn whose backend never receives the spec's
+    ``hooks`` (see :func:`kiro_crew.agent_sdk.spec_hooks.turn_spec_hooks`). Only
+    the spec's hooks run here: the store's own keep their informational fire on
+    the tool call, as before. Returns why the call is blocked, or ``None``.
+
+    Blocks by the same rule the chat turn loop applies: exit 2 is a delivered
+    deny, and any other nonzero exit, a missing store or a fire that raises is a
+    gate with no verdict, which blocks.
+    """
+    if not spec_hooks:
+        return None
+    if hook_store is None:
+        return "hook store not initialized"
+    tool_name = event_title or ""
+    if tool_name.startswith("Running: "):
+        tool_name = tool_name[9:]
+    tool_input = None
+    if event_tool_input:
+        try:
+            tool_input = json.loads(event_tool_input)
+        except Exception:
+            pass
+    try:
+        results = await hook_store.fire(
+            HOOK_EVENT_PRE_TOOL_USE,
+            tool_name=tool_name,
+            tool_input=tool_input,
+            subagent_id=subagent_id,
+            parent_session_key=parent_session_key,
+            agent_role=agent_role,
+            extra_hooks=spec_hooks,
+            extra_hooks_cwd=spec_hooks_cwd,
+            stored_hooks=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - a gate with no verdict blocks
+        logger.warning("spec PreToolUse hook fire failed; blocking tool", exc_info=True)
+        return f"spec hook could not run: {exc}"[:500]
+    for r in results:
+        if r.exit_code == 2:
+            return f"{r.hook_name}: {r.stderr[:200] if r.stderr else 'hook denied'}"
+        if r.exit_code != 0:
+            detail = (
+                r.error[:200] if r.error else (r.stderr[-200:] or f"exited with code {r.exit_code}")
+            )
+            return f"{r.hook_name}: {detail}"
+    return None
