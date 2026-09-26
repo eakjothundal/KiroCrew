@@ -8870,6 +8870,33 @@
       "unexpected_response": "অপ্রত্যাশিত সাড়া",
       "deploy_failed": "ডিপ্লয় ব্যর্থ",
       "stale_preview_retry": "যাচাই করার পর অ্যাপটি বদলে গেছে — আবার চেষ্টা করো।"
+    },
+    "crewLayout": {
+      "element": {
+        "chat": "চ্যাট",
+        "sidePanel": "সাইড প্যানেল",
+        "files": "ফাইল",
+        "git": "গিট",
+        "changes": "পরিবর্তন",
+        "subagents": "সাব-এজেন্ট",
+        "terminal": "টার্মিনাল",
+        "notes": "নোট",
+        "workLog": "কার্য লগ",
+        "group": "গ্রুপ",
+        "tabs": "ট্যাব"
+      },
+      "paletteContent": "বিষয়বস্তু",
+      "hint": "গ্রিডে একটি টাইল টেনে আনুন · ট্যাব যোগ করতে Tabs-এ ফেলুন · সরাতে একটি প্যান বাইরে টানুন",
+      "remove": "সরান",
+      "removeElement": "{{label}} সরান",
+      "dragTile": "{{label}} গ্রিডে টেনে আনুন",
+      "unknownElement": "\"{{element}}\" আর নেই",
+      "cols": "কলাম",
+      "rows": "সারি",
+      "fewerCols": "কম কলাম",
+      "moreCols": "বেশি কলাম",
+      "fewerRows": "কম সারি",
+      "moreRows": "বেশি সারি"
     }
   },
   "hooks": {
@@ -16249,6 +16276,12 @@
       "age_for": "{{age}} ধরে",
       "age_tip": "ব্যাজে দেখানো অবস্থায় কাটানো সময়।",
       "open_chat": "চ্যাট খুলুন"
+    },
+    "layoutEditorHarness": {
+      "title": "লেআউট এডিটর হারনেস",
+      "subtitle": "শুধু ডেভেলপারদের জন্য · একটি লাইভ স্পেকে এডিটর যাচাই করে (RFC §7 PR 2)",
+      "reset": "সিডে রিসেট করুন",
+      "serialized": "সিরিয়ালাইজড LayoutTree"
     }
   },
   "privacyDisclosure": {

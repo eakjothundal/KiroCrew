@@ -8870,6 +8870,33 @@
       "unexpected_response": "अनपेक्षित प्रतिक्रिया",
       "deploy_failed": "डिप्लॉय विफल",
       "stale_preview_retry": "जाँच के बाद ऐप बदल गया — फिर से कोशिश करें।"
+    },
+    "crewLayout": {
+      "element": {
+        "chat": "चैट",
+        "sidePanel": "साइड पैनल",
+        "files": "फ़ाइलें",
+        "git": "गिट",
+        "changes": "परिवर्तन",
+        "subagents": "सब-एजेंट",
+        "terminal": "टर्मिनल",
+        "notes": "नोट्स",
+        "workLog": "कार्य लॉग",
+        "group": "समूह",
+        "tabs": "टैब"
+      },
+      "paletteContent": "सामग्री",
+      "hint": "ग्रिड पर एक टाइल खींचें · टैब जोड़ने के लिए Tabs पर छोड़ें · हटाने के लिए एक पैन बाहर खींचें",
+      "remove": "हटाएं",
+      "removeElement": "{{label}} हटाएं",
+      "dragTile": "{{label}} को ग्रिड पर खींचें",
+      "unknownElement": "\"{{element}}\" अब मौजूद नहीं है",
+      "cols": "कॉलम",
+      "rows": "पंक्तियाँ",
+      "fewerCols": "कम कॉलम",
+      "moreCols": "अधिक कॉलम",
+      "fewerRows": "कम पंक्तियाँ",
+      "moreRows": "अधिक पंक्तियाँ"
     }
   },
   "hooks": {
@@ -16249,6 +16276,12 @@
       "age_for": "{{age}} से",
       "age_tip": "बैज वाली स्थिति में बीता समय।",
       "open_chat": "चैट खोलो"
+    },
+    "layoutEditorHarness": {
+      "title": "लेआउट एडिटर हार्नेस",
+      "subtitle": "केवल डेवलपर के लिए · एक लाइव स्पेक पर एडिटर का परीक्षण करता है (RFC §7 PR 2)",
+      "reset": "सीड पर रीसेट करें",
+      "serialized": "सीरियलाइज़्ड LayoutTree"
     }
   },
   "privacyDisclosure": {

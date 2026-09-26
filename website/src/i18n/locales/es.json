@@ -8990,6 +8990,33 @@
       "unexpected_response": "Respuesta inesperada",
       "deploy_failed": "Error al desplegar",
       "stale_preview_retry": "La aplicación cambió desde la comprobación — inténtalo de nuevo."
+    },
+    "crewLayout": {
+      "element": {
+        "chat": "Chat",
+        "sidePanel": "Panel lateral",
+        "files": "Archivos",
+        "git": "Git",
+        "changes": "Cambios",
+        "subagents": "Subagentes",
+        "terminal": "Terminal",
+        "notes": "Notas",
+        "workLog": "Registro de trabajo",
+        "group": "Grupo",
+        "tabs": "Pestañas"
+      },
+      "paletteContent": "Contenido",
+      "hint": "Arrastra una ficha a la cuadrícula · suéltala en Pestañas para añadir una pestaña · arrastra un panel fuera para quitarlo",
+      "remove": "Quitar",
+      "removeElement": "Quitar {{label}}",
+      "dragTile": "Arrastra {{label}} a la cuadrícula",
+      "unknownElement": "\"{{element}}\" ya no existe",
+      "cols": "columnas",
+      "rows": "filas",
+      "fewerCols": "menos columnas",
+      "moreCols": "más columnas",
+      "fewerRows": "menos filas",
+      "moreRows": "más filas"
     }
   },
   "hooks": {
@@ -16471,6 +16498,12 @@
       "age_for": "desde hace {{age}}",
       "age_tip": "Tiempo en el estado que indica la insignia.",
       "open_chat": "Abrir el chat"
+    },
+    "layoutEditorHarness": {
+      "title": "Banco de pruebas del editor de diseño",
+      "subtitle": "Solo para desarrolladores · prueba el editor sobre una especificación en vivo (RFC §7 PR 2)",
+      "reset": "Restablecer al valor inicial",
+      "serialized": "LayoutTree serializado"
     }
   },
   "privacyDisclosure": {

@@ -8750,6 +8750,33 @@
       "unexpected_response": "予期しないレスポンス",
       "deploy_failed": "デプロイに失敗",
       "stale_preview_retry": "チェック後にアプリが変更されました — もう一度お試しください。"
+    },
+    "crewLayout": {
+      "element": {
+        "chat": "チャット",
+        "sidePanel": "サイドパネル",
+        "files": "ファイル",
+        "git": "Git",
+        "changes": "変更",
+        "subagents": "サブエージェント",
+        "terminal": "ターミナル",
+        "notes": "メモ",
+        "workLog": "作業ログ",
+        "group": "グループ",
+        "tabs": "タブ"
+      },
+      "paletteContent": "コンテンツ",
+      "hint": "タイルをグリッドにドラッグ · タブを追加するには Tabs にドロップ · 削除するにはペインを外へドラッグ",
+      "remove": "削除",
+      "removeElement": "{{label}} を削除",
+      "dragTile": "{{label}} をグリッドにドラッグ",
+      "unknownElement": "\"{{element}}\" は存在しません",
+      "cols": "列",
+      "rows": "行",
+      "fewerCols": "列を減らす",
+      "moreCols": "列を増やす",
+      "fewerRows": "行を減らす",
+      "moreRows": "行を増やす"
     }
   },
   "hooks": {
@@ -16027,6 +16054,12 @@
       "age_for": "{{age}} 経過",
       "age_tip": "バッジの状態にとどまっている時間。",
       "open_chat": "チャットを開く"
+    },
+    "layoutEditorHarness": {
+      "title": "レイアウトエディタのハーネス",
+      "subtitle": "開発者専用 · ライブ仕様でエディタを検証します (RFC §7 PR 2)",
+      "reset": "初期値にリセット",
+      "serialized": "シリアライズされた LayoutTree"
     }
   },
   "privacyDisclosure": {

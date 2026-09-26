@@ -8990,6 +8990,33 @@
       "unexpected_response": "Risposta inaspettata",
       "deploy_failed": "Deploy non riuscito",
       "stale_preview_retry": "L’app è cambiata dopo il controllo — riprova."
+    },
+    "crewLayout": {
+      "element": {
+        "chat": "Chat",
+        "sidePanel": "Pannello laterale",
+        "files": "File",
+        "git": "Git",
+        "changes": "Modifiche",
+        "subagents": "Sottoagenti",
+        "terminal": "Terminale",
+        "notes": "Note",
+        "workLog": "Registro di lavoro",
+        "group": "Gruppo",
+        "tabs": "Schede"
+      },
+      "paletteContent": "Contenuto",
+      "hint": "Trascina una tessera sulla griglia · rilasciala su Schede per aggiungere una scheda · trascina un riquadro fuori per rimuoverlo",
+      "remove": "Rimuovi",
+      "removeElement": "Rimuovi {{label}}",
+      "dragTile": "Trascina {{label}} sulla griglia",
+      "unknownElement": "\"{{element}}\" non esiste più",
+      "cols": "colonne",
+      "rows": "righe",
+      "fewerCols": "meno colonne",
+      "moreCols": "più colonne",
+      "fewerRows": "meno righe",
+      "moreRows": "più righe"
     }
   },
   "hooks": {
@@ -16471,6 +16498,12 @@
       "age_for": "da {{age}}",
       "age_tip": "Tempo nello stato indicato dal badge.",
       "open_chat": "Apri la chat"
+    },
+    "layoutEditorHarness": {
+      "title": "Banco di prova dell’editor di layout",
+      "subtitle": "Solo per sviluppatori · testa l’editor su una specifica dal vivo (RFC §7 PR 2)",
+      "reset": "Ripristina al valore iniziale",
+      "serialized": "LayoutTree serializzato"
     }
   },
   "privacyDisclosure": {
